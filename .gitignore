@@ -1,0 +1,7 @@
+*.csv
+*.png
+*.jpg
+*venv/*
+logs/*
+report/*
+*pycache*
