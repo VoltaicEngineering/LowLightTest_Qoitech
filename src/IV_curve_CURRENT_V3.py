@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 import argparse
 import atexit
+import concurrent.futures
 import csv
 import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 import uuid
@@ -231,6 +233,28 @@ def recover_otii_connection(args):
                 raise RuntimeError("Operator aborted reconnect after timeout")
 
 
+def _call_with_thread_timeout(fn, timeout_s, *args, **kwargs):
+    """Run fn(*args, **kwargs) with a hard timeout. start_recording()/
+    stop_recording() have no timeout of their own; if one hangs, the only
+    thing that used to notice was the *outer* call_with_timeout() wrapping
+    the whole harvest()/short_circuit() call from low_light_app.py -- which
+    meant the operator could see the sweep's progress bar reach 100% (the
+    sweep loop itself had already finished) while the measurement then sat
+    unresponsive for the entire remaining timeout budget before the app's
+    comms-lost recovery finally kicked in (2026-09 feedback: "IV curve
+    fails to terminate even though the progress bar shows 100%"). This
+    surfaces that specific hang in `timeout_s` seconds instead.
+    Like asyncio.to_thread, this cannot actually kill a genuinely stuck
+    call -- if it times out, the underlying thread is simply abandoned
+    (the caller regains control immediately; the orphaned thread exits on
+    its own once/if the blocking call ever returns)."""
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return executor.submit(fn, *args, **kwargs).result(timeout=timeout_s)
+    finally:
+        executor.shutdown(wait=False)
+
+
 def short_circuit(active_proj, my_arcs):
     global Isc
     atexit.register(cleanup, my_arcs)
@@ -242,11 +266,11 @@ def short_circuit(active_proj, my_arcs):
         my_arc.set_main(True)
     time.sleep(0.1)
 
-    active_proj.start_recording()
+    _call_with_thread_timeout(active_proj.start_recording, 10.0)
     time.sleep(0.5)
     recording = active_proj.get_last_recording()
     Isc = -1 * my_arcs[0].get_value("mc")
-    active_proj.stop_recording()
+    _call_with_thread_timeout(active_proj.stop_recording, 10.0)
     time.sleep(0.2)
     return float(Isc)
 
@@ -260,6 +284,7 @@ def harvest(
     live_data_cb=None,
     live_data_interval_s=1.0,
     expected_max_current_uA=None,
+    stop_event=None,
 ):
     if expected_max_current_uA is None or expected_max_current_uA <= 0:
         # Callers derive current_step from Isc as current_step = Isc/150
@@ -286,8 +311,9 @@ def harvest(
     time.sleep(0.1)
 
     recording_started = False
+    recording = None
     try:
-        active_proj.start_recording()
+        _call_with_thread_timeout(active_proj.start_recording, 10.0)
         recording_started = True
         time.sleep(0.5)
         recording = active_proj.get_last_recording()
@@ -300,6 +326,19 @@ def harvest(
             now = time.monotonic()
             if (now - started) > timeout_seconds:
                 raise TimeoutError(f"IV measurement timeout after {timeout_seconds:.1f}s")
+
+            if stop_event is not None and stop_event.is_set():
+                # Operator-requested early stop ("End Sweep Now") -- wind
+                # down any arc that hasn't already hit the voltage cutoff,
+                # then finish exactly like a normal completion. Whatever
+                # the recording captured up to this point is treated as
+                # the final, valid data (explicit operator instruction).
+                for my_arc in my_arcs:
+                    if my_arc.id not in ready:
+                        my_arc.set_main(False)
+                        my_arc.set_main_current(0)
+                        my_arc.set_power_regulation("voltage")
+                break
 
             if progress_cb is not None:
                 progress_cb(min(1.0, current_uA / expected_max_current_uA))
@@ -342,18 +381,24 @@ def harvest(
                 interval = max(ADAPTIVE_INTERVAL_MIN_S, interval * ADAPTIVE_SPEEDUP_FACTOR)
 
             time.sleep(interval)
-
-        if progress_cb is not None:
-            progress_cb(1.0)
-
-        return recording
     finally:
         if recording_started:
             try:
-                active_proj.stop_recording()
+                _call_with_thread_timeout(active_proj.stop_recording, 10.0)
             except Exception:
                 pass
         time.sleep(0.2)
+
+    # Only reached once cleanup above has actually finished -- previously
+    # progress_cb(1.0) fired (and the GUI's progress bar showed 100%)
+    # *before* stop_recording() ran, so if that call hung, the operator saw
+    # a "complete" progress bar while the measurement was actually still
+    # stuck for up to the entire remaining timeout budget (2026-09
+    # feedback). Now the bar only reaches 100% once harvest() is truly done.
+    if progress_cb is not None:
+        progress_cb(1.0)
+
+    return recording
 
 
 def moving_average(data, window_size):

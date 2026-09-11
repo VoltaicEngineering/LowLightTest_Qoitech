@@ -693,6 +693,11 @@ class LowLightApp(QMainWindow):
         self._last_metrics = None
         self._last_recording_info = None
         self._restart_timestamps: list[float] = []
+        # Set by "End Sweep Now" (Ctrl+E) to manually cut a running sweep
+        # short; checked once per sweep-loop iteration in harvest(). Always
+        # cleared at the start of a new measurement so a stale "set" from a
+        # previous one can't instantly end the next sweep too.
+        self._end_sweep_event = threading.Event()
         # Serializes every call that touches the Otii TCP connection
         # (connect, idle-watchdog ping, measurement) so a stale ping can
         # never race real measurement traffic on the same socket -- see the
@@ -929,6 +934,15 @@ class LowLightApp(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         prow_lay.addWidget(self.progress_bar)
+        self.btn_end_sweep = QPushButton("End Sweep Now  (Ctrl+E)")
+        self.btn_end_sweep.setProperty("danger", True)
+        self.btn_end_sweep.setEnabled(False)
+        self.btn_end_sweep.setToolTip(
+            "Stop the IV sweep immediately and use whatever data has been "
+            "captured so far (Ctrl+E)"
+        )
+        self.btn_end_sweep.clicked.connect(self._guard(self._end_sweep_now))
+        prow_lay.addWidget(self.btn_end_sweep)
         self._prog_row.hide()
         clay.addWidget(self._prog_row)
 
@@ -1017,6 +1031,8 @@ class LowLightApp(QMainWindow):
         run_shortcut.activated.connect(self._guard(self._run_test_shortcut))
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         save_shortcut.activated.connect(self._guard(self._save_test_shortcut))
+        end_sweep_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
+        end_sweep_shortcut.activated.connect(self._guard(self._end_sweep_now))
 
         clay.addStretch()
 
@@ -2225,6 +2241,20 @@ class LowLightApp(QMainWindow):
         if self.btn_save.isEnabled():
             self._save_this_test()
 
+    def _end_sweep_now(self):
+        """Manually end the IV sweep in progress -- e.g. if it's taking too
+        long, or appears stuck despite the progress bar showing it's
+        nearly/fully done. Whatever the sweep has captured so far is
+        treated as valid data (explicit operator instruction) and proceeds
+        through the exact same render/save path a natural completion
+        would. Only does anything while a sweep is actually running (the
+        button/shortcut are only enabled during that window)."""
+        if not self.btn_end_sweep.isEnabled():
+            return
+        self.btn_end_sweep.setEnabled(False)
+        self._end_sweep_event.set()
+        self.set_status("Ending the sweep now — using the data captured so far…", "info")
+
     def _start_measurement(self):
         # Disabling Connect too closes the window where a "Reconnect to
         # Otii" click could otherwise run concurrently with this
@@ -2292,10 +2322,12 @@ class LowLightApp(QMainWindow):
             return
 
         self._measuring = True
+        self._end_sweep_event.clear()
 
         def _begin_ui():
             self.btn_run.setEnabled(False)
             self.btn_save.setEnabled(False)
+            self.btn_end_sweep.setEnabled(False)  # only turned on once the sweep itself starts
             self._prog_row.show()
             self.progress_bar.setValue(0)
         self._on_main(_begin_ui)
@@ -2327,6 +2359,7 @@ class LowLightApp(QMainWindow):
                     raise RuntimeError(f"Invalid current step derived from Isc: {current_step}")
 
                 self.set_status("Sweeping IV curve…", "info")
+                self._on_main(lambda: self.btn_end_sweep.setEnabled(True))
 
                 def _on_progress(fraction: float):
                     # Called from the worker thread harvest() runs in —
@@ -2366,16 +2399,20 @@ class LowLightApp(QMainWindow):
                     except Exception:
                         pass
 
-                recording = await call_with_timeout(
-                    harvest,
-                    self.otii_project,
-                    self.otii_devices,
-                    current_step,
-                    sweep_timeout,
-                    _on_progress,
-                    _on_live_data,
-                    timeout=sweep_timeout + max(call_timeout, 15.0),
-                )
+                try:
+                    recording = await call_with_timeout(
+                        harvest,
+                        self.otii_project,
+                        self.otii_devices,
+                        current_step,
+                        sweep_timeout,
+                        _on_progress,
+                        _on_live_data,
+                        timeout=sweep_timeout + max(call_timeout, 15.0),
+                        stop_event=self._end_sweep_event,
+                    )
+                finally:
+                    self._on_main(lambda: self.btn_end_sweep.setEnabled(False))
 
                 my_arc = self.otii_devices[0]
 
