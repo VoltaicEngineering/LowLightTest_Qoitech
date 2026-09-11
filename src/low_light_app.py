@@ -49,6 +49,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QTableWidget,
@@ -842,12 +843,15 @@ class LowLightApp(QMainWindow):
         root.addWidget(self._tab_widget, 1)
 
         # ── Body splitter (upper: plot + controls | lower: table) ───
+        # Collapsible (the default) rather than fixed at a hard minimum --
+        # on a small/13" screen the whole window is often shorter than the
+        # sum of every pane's natural size, and the panes need to actually
+        # shrink (by dragging, or automatically) rather than forcing the
+        # window bigger than the screen and hiding the table entirely.
         body_split = QSplitter(Qt.Orientation.Vertical)
-        body_split.setChildrenCollapsible(False)
         self._tab_widget.addTab(body_split, "Measure")
 
         upper_split = QSplitter(Qt.Orientation.Horizontal)
-        upper_split.setChildrenCollapsible(False)
 
         # Plot column: IV curve on top, lux/irradiance timeseries below.
         plot_container = QWidget()
@@ -877,7 +881,13 @@ class LowLightApp(QMainWindow):
 
         upper_split.addWidget(plot_container)
 
-        # Controls
+        # Controls -- stacking a status badge, prereq banner, live-sensor
+        # card, connect button, panel-details form, and results all in one
+        # column adds up to more natural height than a 13" laptop screen
+        # has room for. Wrapping it in a scroll area (instead of giving it a
+        # minimum size) means the splitter can shrink this pane as small as
+        # the window needs; the controls just scroll internally rather than
+        # forcing the window -- and the table pane below it -- off-screen.
         ctrl = QWidget()
         ctrl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         clay = QVBoxLayout(ctrl)
@@ -1002,8 +1012,16 @@ class LowLightApp(QMainWindow):
         save_shortcut.activated.connect(self._guard(self._save_test_shortcut))
 
         clay.addStretch()
-        upper_split.addWidget(ctrl)
+
+        ctrl_scroll = QScrollArea()
+        ctrl_scroll.setWidget(ctrl)
+        ctrl_scroll.setWidgetResizable(True)
+        ctrl_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        ctrl_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        upper_split.addWidget(ctrl_scroll)
         upper_split.setSizes([650, 380])
+        upper_split.setStretchFactor(0, 3)
+        upper_split.setStretchFactor(1, 2)
         body_split.addWidget(upper_split)
 
         # Lower: table + bottom buttons
@@ -1056,7 +1074,9 @@ class LowLightApp(QMainWindow):
         blay.addLayout(btn_row)
 
         body_split.addWidget(bottom)
-        body_split.setSizes([680, 320])
+        body_split.setSizes([550, 400])
+        body_split.setStretchFactor(0, 3)
+        body_split.setStretchFactor(1, 2)
 
         self._tab_widget.addTab(self._build_analysis_tab(), "Analysis")
         self._tab_widget.addTab(self._build_panel_config_tab(), "Panel Config")
