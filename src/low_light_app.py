@@ -73,6 +73,7 @@ from IV_curve_CURRENT_V3 import (
     build_clipboard_row,
     connect_otii_session,
     copy_to_clipboard,
+    derive_panel_type,
     fetch_recording_channels,
     harvest,
     make_row,
@@ -80,6 +81,7 @@ from IV_curve_CURRENT_V3 import (
     read_max_run_index,
     render_iv_curve,
     restart_otii_app,
+    rewrite_summary_csv,
     short_circuit,
 )
 
@@ -87,16 +89,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = PROJECT_ROOT / "cache"
 DEFAULT_SUMMARY_CSV = PROJECT_ROOT / "report" / "LowLightTesting_summary.csv"
 
-# Constants carried over unchanged from listen.py / IV_curve_CURRENT_V3.py defaults.
+# Constants carried over unchanged from listen.py / IV_curve_CURRENT_V3.py defaults,
+# except the poll/redraw cadences below -- tightened (2026-09) to cut the
+# perceived lag between the physical sensors and what's on screen. The lux
+# meter's own settle time (LUX_SETTLE_S) is the real floor on read rate and
+# is left alone (it's an accuracy setting, not just latency); the polling
+# loop's *extra* wait between reads is what actually got tightened.
 LUX_TIMEOUT_S = 1.0
 LUX_SETTLE_S = 0.25
-LUX_POLL_INTERVAL_S = 1.0
+LUX_POLL_INTERVAL_S = 0.3
 IRR_BAUD_DEFAULT = 115200
 IRR_WINDOW_S = 10.0
 MIN_IRR_SAMPLES = 3
 LIVE_STALE_S = 5.0
 TIMESERIES_HISTORY_S = 600.0  # how much lux/irradiance history the timeseries plot keeps
-TIMESERIES_REDRAW_MS = 2000
+TIMESERIES_REDRAW_MS = 400
 
 # Stable, deterministic color assignment (by sorted group label) for the
 # Analysis tab's 4 graphs, so a given panel type keeps the same color
@@ -739,7 +746,7 @@ class LowLightApp(QMainWindow):
         self._auto_connect_sensors_if_needed()
 
         self._live_timer = QTimer(self)
-        self._live_timer.setInterval(500)
+        self._live_timer.setInterval(150)
         self._live_timer.timeout.connect(self._guard(self._update_live_readouts))
         self._live_timer.start()
 
@@ -2677,7 +2684,92 @@ class LowLightApp(QMainWindow):
         field = _FIELD_MAP.get(col)
         if field is None or row_idx >= len(self.session_rows):
             return
-        self.session_rows[row_idx][field] = item.text()
+
+        old_value = self.session_rows[row_idx].get(field, "")
+        new_value = item.text()
+        if new_value == old_value:
+            return
+        self.session_rows[row_idx][field] = new_value
+
+        # Every row shown in this table is already a saved row (rows only
+        # ever get here via _save_this_test() or reloading a working
+        # folder's summary CSV) -- so any edit here is, by definition, an
+        # edit to an already-persisted measurement. Previously this only
+        # updated the in-memory table; the summary CSV on disk (and hence
+        # the Analysis tab, which always re-reads it from disk) never saw
+        # the edit at all.
+        if field == "panel_name":
+            old_name, new_name = old_value, new_value
+            self.session_rows[row_idx]["panel_type"] = derive_panel_type(new_name)
+            self._rename_panel_in_saved_files(row_idx, old_name, new_name)
+
+        self._rewrite_summary_csv()
+
+        if field == "panel_name":
+            self._refresh_analysis_tab()
+
+    def _rewrite_summary_csv(self) -> None:
+        """Rewrite the whole working folder's summary CSV from
+        self.session_rows (the complete, current set of rows -- it mirrors
+        the table exactly). append_summary_csv() only ever adds new rows,
+        so an edit to an existing row needs this instead."""
+        try:
+            rewrite_summary_csv(self.settings["summary_csv"], self.session_rows)
+        except Exception as e:
+            _log("error", "summary_csv_rewrite_failed", error=str(e))
+            self.set_status(f"Edit kept in the table, but rewriting the summary CSV failed: {e}", "warning")
+
+    def _rename_panel_in_saved_files(self, row_idx: int, old_name: str, new_name: str) -> None:
+        """Renaming a Panel Name in the table should also rename that
+        measurement's own IV-curve PNG/CSV files on disk -- they bake the
+        panel name into their filename at render time (see render_iv_curve
+        in IV_curve_CURRENT_V3.py), so otherwise the files and the table
+        would silently disagree about which panel they're for. Uses the
+        exact paths recorded on the row at render time (png_path/csv_path)
+        rather than reconstructing a filename, since the row's own
+        timestamp (set later, after the mandatory temp prompt) doesn't
+        necessarily match the one baked into the filename."""
+        row = self.session_rows[row_idx]
+        renamed, missing, failed = [], [], []
+        for path_key in ("png_path", "csv_path"):
+            old_path_str = row.get(path_key, "")
+            if not old_path_str:
+                continue
+            old_path = Path(old_path_str)
+            if not old_path.exists():
+                missing.append(old_path.name)
+                continue
+
+            new_name_on_disk = old_path.name.replace(f"Panel {old_name} ", f"Panel {new_name} ", 1)
+            if new_name_on_disk == old_path.name:
+                # The old name wasn't found verbatim in the filename --
+                # don't guess at a rename, just leave the file alone.
+                continue
+
+            new_path = old_path.with_name(new_name_on_disk)
+            try:
+                old_path.rename(new_path)
+            except Exception as e:
+                _log("error", "rename_saved_file_failed", path=old_path_str, error=str(e))
+                failed.append(old_path.name)
+                continue
+            row[path_key] = str(new_path)
+            renamed.append(new_path.name)
+
+        if failed:
+            self.set_status(
+                f"Renamed \"{old_name}\" to \"{new_name}\" in the table, but couldn't rename "
+                f"the saved file(s) on disk: {', '.join(failed)}",
+                "warning",
+            )
+        elif missing:
+            self.set_status(
+                f"Renamed \"{old_name}\" to \"{new_name}\" in the table, but the saved file(s) "
+                f"recorded for this row are missing on disk: {', '.join(missing)}",
+                "warning",
+            )
+        elif renamed:
+            self.set_status(f"Renamed \"{old_name}\" to \"{new_name}\" — updated {len(renamed)} saved file(s) too.", "success")
 
     def _copy_table_selection(self):
         selection = self.table.selectedItems()

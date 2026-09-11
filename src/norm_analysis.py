@@ -8,7 +8,9 @@ domain logic, low_light_app.py = GUI orchestration).
 Methodology (confirmed with the operator, since the source Google Slides
 deck wasn't directly viewable):
     Ref_X[group] = average(X over all group measurements with
-                            970 <= irradiance_measured_live <= 1030)
+                            irradiance_measured_live within +/-tolerance
+                            of 1000 W/m^2 -- 900 <= ... <= 1100 at the
+                            default 10% tolerance, adjustable in Settings)
     Norm_X (%)   = X_measured / Ref_X[group] * 100
 for X in {Wp, Vp, Ip, Isc}. A "group" is (cell_type, cells_series,
 cells_parallel) from the panel config file, keyed by each panel name's
@@ -21,7 +23,7 @@ import csv
 import re
 from pathlib import Path
 
-DEFAULT_TOLERANCE = 0.03  # +/-3% of 1000 W/m^2
+DEFAULT_TOLERANCE = 0.10  # +/-10% of 1000 W/m^2
 REFERENCE_IRRADIANCE = 1000.0
 
 _SERIAL_PREFIX_PATTERN = re.compile(r"^([A-Za-z]+\d*)")

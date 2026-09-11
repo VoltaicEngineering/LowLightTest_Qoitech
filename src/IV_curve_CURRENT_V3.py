@@ -365,43 +365,65 @@ def copy_to_clipboard(text):
         return False
 
 
+SUMMARY_CSV_FIELDNAMES = [
+    "session_id",
+    "run_index",
+    "status",
+    "timestamp",
+    "panel_type",
+    "panel_name",
+    "light_meter",
+    "irradiance_gui_input",
+    "lux_measured",
+    "irradiance_measured_live",
+    "irradiance_live_samples",
+    "Wp",
+    "Vp",
+    "Ip",
+    "Voc",
+    "Isc",
+    "notes",
+    "error",
+    "source",
+    "panel_temp_c",
+    "lux_stdev",
+    "irradiance_stdev",
+    "lux_3sigma_pct",
+    "irradiance_3sigma_pct",
+    "png_path",
+    "csv_path",
+]
+
+
 def append_summary_csv(csv_path, row_values):
     csv_file = Path(csv_path)
     csv_file.parent.mkdir(parents=True, exist_ok=True)
 
-    fieldnames = [
-        "session_id",
-        "run_index",
-        "status",
-        "timestamp",
-        "panel_type",
-        "panel_name",
-        "light_meter",
-        "irradiance_gui_input",
-        "lux_measured",
-        "irradiance_measured_live",
-        "irradiance_live_samples",
-        "Wp",
-        "Vp",
-        "Ip",
-        "Voc",
-        "Isc",
-        "notes",
-        "error",
-        "source",
-        "panel_temp_c",
-        "lux_stdev",
-        "irradiance_stdev",
-        "lux_3sigma_pct",
-        "irradiance_3sigma_pct",
-    ]
-
     file_exists = csv_file.exists()
     with csv_file.open("a", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer = csv.DictWriter(fh, fieldnames=SUMMARY_CSV_FIELDNAMES)
         if not file_exists:
             writer.writeheader()
-        writer.writerow({k: row_values.get(k, "") for k in fieldnames})
+        writer.writerow({k: row_values.get(k, "") for k in SUMMARY_CSV_FIELDNAMES})
+
+    return csv_file
+
+
+def rewrite_summary_csv(csv_path, rows):
+    """Rewrite the whole summary CSV from a list of row dicts (the same
+    shape make_row() produces) -- used when an already-saved row is edited
+    in place (e.g. renaming a panel in the GUI's session table), since
+    append_summary_csv() only ever adds new rows. Overwrites the file
+    entirely; the caller is responsible for `rows` being the complete,
+    current set (GUI: self.session_rows, which mirrors the table)."""
+    csv_file = Path(csv_path)
+    csv_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with csv_file.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=SUMMARY_CSV_FIELDNAMES)
+        writer.writeheader()
+        for row_values in rows:
+            writer.writerow({k: row_values.get(k, "") for k in SUMMARY_CSV_FIELDNAMES})
 
     return csv_file
 
@@ -576,6 +598,10 @@ def render_iv_curve(
         "Ip": max_current,
         "Voc": voc,
         "Isc": isc,
+        # Recorded so a later panel-name edit (GUI session table) can find
+        # and rename these exact files instead of guessing a filename.
+        "png_path": str(png_path),
+        "csv_path": str(csv_path),
     }
 
 
@@ -716,6 +742,8 @@ def make_row(
     irradiance_stdev="",
     lux_3sigma_pct="",
     irradiance_3sigma_pct="",
+    png_path="",
+    csv_path="",
 ):
     row = {
         "session_id": session_id,
@@ -741,6 +769,8 @@ def make_row(
         "irradiance_stdev": irradiance_stdev,
         "lux_3sigma_pct": lux_3sigma_pct,
         "irradiance_3sigma_pct": irradiance_3sigma_pct,
+        "png_path": png_path,
+        "csv_path": csv_path,
         "source": "iv_curve_current_v3",
     }
 
@@ -756,6 +786,13 @@ def make_row(
         row["Ip"] = float(metrics["Ip"])
         row["Voc"] = float(metrics["Voc"])
         row["Isc"] = float(metrics["Isc"])
+        # render_iv_curve()/plot_iv_curve() already record the exact files
+        # they wrote as part of metrics -- fall back to those if the caller
+        # didn't pass png_path/csv_path explicitly.
+        if not row["png_path"]:
+            row["png_path"] = metrics.get("png_path", "")
+        if not row["csv_path"]:
+            row["csv_path"] = metrics.get("csv_path", "")
 
     return row
 
