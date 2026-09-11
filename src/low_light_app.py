@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import csv
+import functools
 import json
 import os
 import re
@@ -71,11 +72,12 @@ from IV_curve_CURRENT_V3 import (
     build_clipboard_row,
     connect_otii_session,
     copy_to_clipboard,
+    fetch_recording_channels,
     harvest,
     make_row,
     moving_average,
-    plot_iv_curve,
     read_max_run_index,
+    render_iv_curve,
     restart_otii_app,
     short_circuit,
 )
@@ -104,11 +106,12 @@ _ANALYSIS_PALETTE = [
 ]
 
 _COLUMNS = [
-    "Panel Name", "Time", "Wp", "Voc", "Isc", "Vp", "Ip",
-    "Light Meter", "SI (GUI)", "Temp (°C)", "Lux", "Lux StdDev", "Irradiance", "Irr StdDev", "Notes",
+    "Panel Name", "Time", "Wp (W)", "Voc (V)", "Isc (A)", "Vp (V)", "Ip (A)",
+    "Light Meter", "SI (GUI) (W/m²)", "Temp (°C)", "Lux (lx)", "Lux StdDev (lx)", "Lux 3σ/Avg (%)",
+    "Irradiance (W/m²)", "Irr StdDev (W/m²)", "Irr 3σ/Avg (%)", "Notes",
 ]
-_EDITABLE_COLS = {0, 7, 8, 9, 14}
-_FIELD_MAP = {0: "panel_name", 7: "light_meter", 8: "irradiance_gui_input", 9: "panel_temp_c", 14: "notes"}
+_EDITABLE_COLS = {0, 7, 8, 9, 16}
+_FIELD_MAP = {0: "panel_name", 7: "light_meter", 8: "irradiance_gui_input", 9: "panel_temp_c", 16: "notes"}
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +346,7 @@ DEFAULT_SETTINGS = {
 }
 
 SESSION_CSV_NAME = "LowLightTesting_summary.csv"
+PENDING_MEASUREMENT_FILENAME = ".pending_measurement.json"
 
 
 def load_settings() -> dict:
@@ -659,7 +663,17 @@ class LowLightApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
-        self._ui_call.connect(lambda fn: fn())
+
+        def _run_marshaled_fn(fn):
+            try:
+                fn()
+            except Exception as e:
+                _log("error", "unhandled_on_main_exception", error=str(e))
+                try:
+                    self.set_status(f"Internal error (caught): {e}", "error")
+                except Exception:
+                    pass
+        self._ui_call.connect(_run_marshaled_fn)
         self._async_worker = AsyncWorker()
 
         # Otii session state
@@ -671,6 +685,15 @@ class LowLightApp(QMainWindow):
         self._last_metrics = None
         self._last_recording_info = None
         self._restart_timestamps: list[float] = []
+        # Serializes every call that touches the Otii TCP connection
+        # (connect, idle-watchdog ping, measurement) so a stale ping can
+        # never race real measurement traffic on the same socket -- see the
+        # 2026-09 adversarial review. Safe to construct here even though no
+        # event loop is running yet: asyncio.Lock only binds to a loop on
+        # first await, and every await of this lock happens on
+        # self._async_worker.loop.
+        self._otii_lock = asyncio.Lock()
+        self._recovering = False
 
         # Session table state
         self.session_rows: list[dict] = []
@@ -696,7 +719,7 @@ class LowLightApp(QMainWindow):
         self._build_ui()
 
         self._progress_bridge = _ProgressBridge()
-        self._progress_bridge.progress.connect(self._on_progress_value)
+        self._progress_bridge.progress.connect(self._guard1(self._on_progress_value))
 
         # Load the panel config before the first Analysis-tab refresh (which
         # _apply_working_dir() below triggers).
@@ -716,18 +739,54 @@ class LowLightApp(QMainWindow):
 
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(500)
-        self._live_timer.timeout.connect(self._update_live_readouts)
+        self._live_timer.timeout.connect(self._guard(self._update_live_readouts))
         self._live_timer.start()
 
         self._watchdog_timer = QTimer(self)
         self._watchdog_timer.setInterval(7000)
-        self._watchdog_timer.timeout.connect(self._idle_watchdog_tick)
+        self._watchdog_timer.timeout.connect(self._guard(self._idle_watchdog_tick))
         self._watchdog_timer.start()
 
         self._ts_redraw_timer = QTimer(self)
         self._ts_redraw_timer.setInterval(TIMESERIES_REDRAW_MS)
-        self._ts_redraw_timer.timeout.connect(self._redraw_timeseries)
+        self._ts_redraw_timer.timeout.connect(self._guard(self._redraw_timeseries))
         self._ts_redraw_timer.start()
+
+    # ------------------------------------------------------------------
+    # Shutdown safety
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event) -> None:
+        """Refuse to close silently while a measurement is running or while
+        a completed-but-unsaved result is sitting at "click Save This Test"
+        -- otherwise the X button / Alt+F4 / a Windows shutdown discards a
+        real, already-collected measurement with zero warning (2026-09
+        adversarial review finding #1)."""
+        if self._measuring:
+            resp = QMessageBox.question(
+                self,
+                "Measurement in progress",
+                "A measurement is currently running. Closing now will abandon it and "
+                "the data will be lost. Close anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        elif self._last_metrics is not None:
+            resp = QMessageBox.question(
+                self,
+                "Unsaved measurement",
+                "The last measurement hasn't been saved yet (click \"Save This Test\" first). "
+                "Closing now will discard it. Close anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        event.accept()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -774,7 +833,7 @@ class LowLightApp(QMainWindow):
             "border-radius:6px; font-size:10pt; font-weight:bold; min-height:0; padding:4px 10px; }"
             "QPushButton:hover { background:#e8eaed; }"
         )
-        settings_btn.clicked.connect(self._open_settings_dialog)
+        settings_btn.clicked.connect(self._guard(self._open_settings_dialog))
         hlay.addWidget(settings_btn)
         root.addWidget(header)
 
@@ -875,7 +934,7 @@ class LowLightApp(QMainWindow):
         self._refresh_port_lists()
         refresh_btn = QPushButton("Refresh Ports")
         refresh_btn.setToolTip("Re-scan COM ports, re-run auto-detect, and connect any newly found sensor")
-        refresh_btn.clicked.connect(self._auto_connect_sensors_if_needed)
+        refresh_btn.clicked.connect(self._guard(self._auto_connect_sensors_if_needed))
         sensors_form.addRow("Lux meter port:", self.lux_port_combo)
         sensors_form.addRow("Irradiance port:", self.irr_port_combo)
         clay.addLayout(sensors_form)
@@ -883,7 +942,7 @@ class LowLightApp(QMainWindow):
         sensor_btn_row = QHBoxLayout()
         connect_sensors_btn = QPushButton("Connect Sensors")
         connect_sensors_btn.setProperty("primary", True)
-        connect_sensors_btn.clicked.connect(self._manual_connect_sensors)
+        connect_sensors_btn.clicked.connect(self._guard(self._manual_connect_sensors))
         sensor_btn_row.addWidget(connect_sensors_btn)
         sensor_btn_row.addWidget(refresh_btn)
         clay.addLayout(sensor_btn_row)
@@ -894,7 +953,7 @@ class LowLightApp(QMainWindow):
         clay.addWidget(self._section_label("STEP 1 — Connect to Otii"))
         self.btn_connect = QPushButton("Connect to Otii")
         self.btn_connect.setProperty("primary", True)
-        self.btn_connect.clicked.connect(self._connect_instrument)
+        self.btn_connect.clicked.connect(self._guard(self._connect_instrument))
         clay.addWidget(self.btn_connect)
 
         clay.addWidget(self._separator())
@@ -918,7 +977,7 @@ class LowLightApp(QMainWindow):
         self.btn_run.setProperty("primary", True)
         self.btn_run.setEnabled(False)
         self.btn_run.setToolTip("Run Test (Ctrl+R)")
-        self.btn_run.clicked.connect(self._start_measurement)
+        self.btn_run.clicked.connect(self._guard(self._start_measurement))
         clay.addWidget(self.btn_run)
 
         clay.addWidget(self._separator())
@@ -934,13 +993,13 @@ class LowLightApp(QMainWindow):
         self.btn_save.setProperty("primary", True)
         self.btn_save.setEnabled(False)
         self.btn_save.setToolTip("Save This Test (Ctrl+S)")
-        self.btn_save.clicked.connect(self._save_this_test)
+        self.btn_save.clicked.connect(self._guard(self._save_this_test))
         clay.addWidget(self.btn_save)
 
         run_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
-        run_shortcut.activated.connect(self._run_test_shortcut)
+        run_shortcut.activated.connect(self._guard(self._run_test_shortcut))
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
-        save_shortcut.activated.connect(self._save_test_shortcut)
+        save_shortcut.activated.connect(self._guard(self._save_test_shortcut))
 
         clay.addStretch()
         upper_split.addWidget(ctrl)
@@ -961,7 +1020,7 @@ class LowLightApp(QMainWindow):
             "Choose the folder this session's IV curve files are saved to. "
             "If it already has saved measurements, they're reloaded."
         )
-        wd_btn.clicked.connect(self._choose_working_dir)
+        wd_btn.clicked.connect(self._guard(self._choose_working_dir))
         wd_row.addWidget(self.working_dir_lbl, 1)
         wd_row.addWidget(wd_btn)
         blay.addLayout(wd_row)
@@ -981,17 +1040,17 @@ class LowLightApp(QMainWindow):
         hdr.setSectionResizeMode(len(_COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(0, 120)
         copy_sc = QShortcut(QKeySequence.StandardKey.Copy, self.table)
-        copy_sc.activated.connect(self._copy_table_selection)
-        self.table.itemChanged.connect(self._on_table_item_changed)
+        copy_sc.activated.connect(self._guard(self._copy_table_selection))
+        self.table.itemChanged.connect(self._guard1(self._on_table_item_changed))
         blay.addWidget(self.table, 1)
 
         btn_row = QHBoxLayout()
         self.btn_finish = QPushButton("Save All && Finish")
         self.btn_finish.setProperty("primary", True)
-        self.btn_finish.clicked.connect(self._save_all_and_finish)
+        self.btn_finish.clicked.connect(self._guard(self._save_all_and_finish))
         self.btn_reset = QPushButton("Start Over")
         self.btn_reset.setProperty("danger", True)
-        self.btn_reset.clicked.connect(self._start_over)
+        self.btn_reset.clicked.connect(self._guard(self._start_over))
         btn_row.addWidget(self.btn_finish, 2)
         btn_row.addWidget(self.btn_reset, 1)
         blay.addLayout(btn_row)
@@ -1016,7 +1075,7 @@ class LowLightApp(QMainWindow):
         self.panel_config_lbl.setStyleSheet("color:#444; font-size:9pt;")
         reload_btn = QPushButton("Reload Panel Config")
         reload_btn.setToolTip("Re-read the panel config file (e.g. after editing it externally) and redraw")
-        reload_btn.clicked.connect(self._reload_panel_config)
+        reload_btn.clicked.connect(self._guard(self._reload_panel_config))
         top_row.addWidget(self.analysis_status_lbl, 1)
         top_row.addWidget(self.panel_config_lbl)
         top_row.addWidget(reload_btn)
@@ -1047,7 +1106,7 @@ class LowLightApp(QMainWindow):
             filter_row.addLayout(col)
         clear_filters_btn = QPushButton("Clear Filters")
         clear_filters_btn.setToolTip("No selection in a filter list means \"show all\" for that dimension")
-        clear_filters_btn.clicked.connect(self._clear_analysis_filters)
+        clear_filters_btn.clicked.connect(self._guard(self._clear_analysis_filters))
         filter_row.addWidget(clear_filters_btn, alignment=Qt.AlignmentFlag.AlignBottom)
         layout.addLayout(filter_row)
 
@@ -1062,7 +1121,7 @@ class LowLightApp(QMainWindow):
         analysis_fig.tight_layout()
         self.analysis_canvas.draw()
         self._analysis_hover_annotation = None
-        self.analysis_canvas.mpl_connect("motion_notify_event", self._on_analysis_hover)
+        self.analysis_canvas.mpl_connect("motion_notify_event", self._guard1(self._on_analysis_hover))
 
         self.analysis_toolbar = NavigationToolbar2QT(self.analysis_canvas, tab)
         layout.addWidget(self.analysis_toolbar)
@@ -1075,7 +1134,7 @@ class LowLightApp(QMainWindow):
         widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         widget.setFixedHeight(70)
         widget.setMinimumWidth(90)
-        widget.itemSelectionChanged.connect(self._refresh_analysis_tab)
+        widget.itemSelectionChanged.connect(self._guard(self._refresh_analysis_tab))
         return widget
 
     def _build_panel_config_tab(self) -> QWidget:
@@ -1110,18 +1169,18 @@ class LowLightApp(QMainWindow):
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
         self.panel_config_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.panel_config_table.itemChanged.connect(self._on_panel_config_table_changed)
+        self.panel_config_table.itemChanged.connect(self._guard(self._on_panel_config_table_changed))
         layout.addWidget(self.panel_config_table, 1)
 
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add Row")
-        add_btn.clicked.connect(self._add_panel_config_row)
+        add_btn.clicked.connect(self._guard(self._add_panel_config_row))
         delete_btn = QPushButton("Delete Selected Row(s)")
         delete_btn.setProperty("danger", True)
-        delete_btn.clicked.connect(self._delete_panel_config_rows)
+        delete_btn.clicked.connect(self._guard(self._delete_panel_config_rows))
         reload_btn = QPushButton("Reload From File")
         reload_btn.setToolTip("Discard unsaved table edits and re-read the file from disk")
-        reload_btn.clicked.connect(self._reload_panel_config)
+        reload_btn.clicked.connect(self._guard(self._reload_panel_config))
         btn_row.addWidget(add_btn)
         btn_row.addWidget(delete_btn)
         btn_row.addWidget(reload_btn)
@@ -1449,6 +1508,62 @@ class LowLightApp(QMainWindow):
         self.ts_canvas.figure.tight_layout()
         self.ts_canvas.draw_idle()
 
+    def _guard(self, fn):
+        """Wrap a plain Qt slot method so an unhandled exception is caught,
+        logged, and surfaced via set_status() instead of propagating back
+        into Qt's C++ call stack. Verified empirically (2026-09 adversarial
+        review finding #8): a Python exception escaping a slot connected via
+        a direct (same-thread) signal/slot connection -- which is what every
+        plain button/table/filter/timer slot in this app uses -- aborts the
+        whole process immediately with no traceback at all, regardless of
+        any try/except elsewhere in the call stack, and regardless of
+        whether an event loop is even running. Overriding
+        QApplication.notify() does NOT help (also verified) -- the
+        exception has to be caught inside the connected callable itself,
+        before control ever returns to C++. This generalizes what
+        _launch_task already did narrowly for the handful of slots that
+        schedule an async task to every other plain slot.
+
+        Deliberately takes NO parameters itself (not *args/**kwargs) -- also
+        verified empirically. PyQt's signal/slot connection logic inspects
+        a connected callable's own declared arity to decide how many of the
+        signal's arguments to actually pass it (e.g. QPushButton.clicked
+        normally trims its bool `checked` argument down to nothing for a
+        zero-arg slot); a *args/**kwargs wrapper defeats that -- PyQt sees
+        "accepts anything" and passes the signal's arguments through, which
+        then blows up calling e.g. _start_measurement(self) with an
+        unexpected extra positional argument. functools.wraps() does NOT
+        fix this (also verified) -- it only copies cosmetic metadata, not
+        the wrapper's actual call signature. Use _guard1() instead for the
+        handful of slots that do need the signal's one argument."""
+        @functools.wraps(fn)
+        def _wrapped():
+            try:
+                return fn()
+            except Exception as e:
+                _log("error", "unhandled_slot_exception", slot=getattr(fn, "__name__", str(fn)), error=str(e))
+                try:
+                    self.set_status(f"Internal error (caught): {e}", "error")
+                except Exception:
+                    pass
+        return _wrapped
+
+    def _guard1(self, fn):
+        """Same as _guard(), for the slots that need the signal's one
+        argument (QTableWidget.itemChanged's QTableWidgetItem, the progress
+        bridge's float, matplotlib's mpl_connect event)."""
+        @functools.wraps(fn)
+        def _wrapped(arg):
+            try:
+                return fn(arg)
+            except Exception as e:
+                _log("error", "unhandled_slot_exception", slot=getattr(fn, "__name__", str(fn)), error=str(e))
+                try:
+                    self.set_status(f"Internal error (caught): {e}", "error")
+                except Exception:
+                    pass
+        return _wrapped
+
     def _on_main(self, fn) -> None:
         """Run fn() on the Qt main thread. Safe to call from any thread --
         uses Qt's own native signal/slot queuing (not qasync's), which runs
@@ -1581,12 +1696,19 @@ class LowLightApp(QMainWindow):
         else:
             self.set_status(f"Working folder set to {folder}.", "info")
 
+        # A leftover pending-measurement file here means a previous session
+        # crashed/closed after the mandatory temp prompt but before Save
+        # This Test -- surface it so that measurement's data isn't silently
+        # forgotten (2026-09 adversarial review finding #5). Overrides the
+        # status set just above since it's the more urgent thing to know.
+        self._check_pending_measurement_file(folder)
+
         self._refresh_analysis_tab()
 
     _NUMERIC_ROW_FIELDS = (
         "Wp", "Voc", "Isc", "Vp", "Ip",
         "lux_measured", "irradiance_measured_live", "irradiance_live_samples",
-        "lux_stdev", "irradiance_stdev",
+        "lux_stdev", "irradiance_stdev", "lux_3sigma_pct", "irradiance_3sigma_pct",
     )
 
     def _load_session_from_folder(self, folder: Path) -> int:
@@ -1859,6 +1981,21 @@ class LowLightApp(QMainWindow):
         await asyncio.sleep(self.settings["otii_restart_wait_seconds"])
         return True
 
+    def _close_otii_connection(self) -> None:
+        """Close the previous Otii TCP socket (if any) before replacing it
+        with a fresh one on every connect/reconnect/auto-restart-retry --
+        otherwise each cycle over a long session leaks a socket that's
+        never explicitly closed (2026-09 adversarial review finding #6).
+        Must only be called while holding self._otii_lock, since it mutates
+        connection state shared with the ping/measurement paths."""
+        old = self.otii_connection
+        if old is None:
+            return
+        try:
+            old.close_connection()
+        except Exception:
+            pass
+
     async def _async_connect_instrument(self):
         self.set_status("Connecting to Otii…", "info")
         # Any Otii action supersedes the (possibly still-pending) sensor
@@ -1866,40 +2003,45 @@ class LowLightApp(QMainWindow):
         self._sensor_connect_status_pending = False
         self._set_otii_badge("● Otii: connecting…", "#ffe6a6")
 
-        try:
-            connection, otii_object, active_proj, devices = await call_with_timeout(
-                connect_otii_session, timeout=self.settings["otii_call_timeout_seconds"]
-            )
-        except OtiiCommsTimeout as e:
-            self._show_otii_error(str(e))
-            return
-        except OSError as e:
-            # Connection actively refused/unreachable -- Otii almost
-            # certainly isn't running. Auto-locate + launch it, then retry
-            # the connect once (point 3 of the 2026-09 feedback).
-            launched = await self._ensure_otii_running()
-            if not launched:
-                # _ensure_otii_running() already set a specific status
-                # message (e.g. "already running but unreachable" vs.
-                # "couldn't be located") -- don't overwrite it here.
-                self._show_otii_error(str(e), set_status_text=False)
-                return
+        # Holds the same lock a measurement/ping would hold while touching
+        # the connection, so a connect/reconnect can never interleave with
+        # either of those on the same socket (2026-09 adversarial review).
+        async with self._otii_lock:
             try:
                 connection, otii_object, active_proj, devices = await call_with_timeout(
                     connect_otii_session, timeout=self.settings["otii_call_timeout_seconds"]
                 )
-            except Exception as e2:
-                self._show_otii_error(str(e2))
+            except OtiiCommsTimeout as e:
+                self._show_otii_error(str(e))
                 return
-        except Exception as e:
-            self._show_otii_error(str(e))
-            return
+            except OSError as e:
+                # Connection actively refused/unreachable -- Otii almost
+                # certainly isn't running. Auto-locate + launch it, then retry
+                # the connect once (point 3 of the 2026-09 feedback).
+                launched = await self._ensure_otii_running()
+                if not launched:
+                    # _ensure_otii_running() already set a specific status
+                    # message (e.g. "already running but unreachable" vs.
+                    # "couldn't be located") -- don't overwrite it here.
+                    self._show_otii_error(str(e), set_status_text=False)
+                    return
+                try:
+                    connection, otii_object, active_proj, devices = await call_with_timeout(
+                        connect_otii_session, timeout=self.settings["otii_call_timeout_seconds"]
+                    )
+                except Exception as e2:
+                    self._show_otii_error(str(e2))
+                    return
+            except Exception as e:
+                self._show_otii_error(str(e))
+                return
 
-        self.otii_connection = connection
-        self.otii_object = otii_object
-        self.otii_project = active_proj
-        self.otii_devices = devices
-        self._restart_timestamps.clear()
+            self._close_otii_connection()
+            self.otii_connection = connection
+            self.otii_object = otii_object
+            self.otii_project = active_proj
+            self.otii_devices = devices
+            self._restart_timestamps.clear()
 
         self._set_otii_badge(f"● Otii: connected ({len(devices)} Arc)", "#a6ffcc")
         self.set_status("Otii connected — fill in panel details and click Run Test", "success")
@@ -1935,82 +2077,104 @@ class LowLightApp(QMainWindow):
             self._ping_in_flight = False
 
     async def _ping_otii(self):
+        # If a measurement or a connect/reconnect is already using the Otii
+        # connection, skip this tick rather than queuing behind it -- a
+        # ping that then judges a now-stale result once it finally gets the
+        # lock is exactly what let a stale idle-health-check ping
+        # force-restart Otii out from under an active measurement (2026-09
+        # adversarial review finding #3). It'll be checked again next tick.
+        if self._otii_lock.locked():
+            self._ping_in_flight = False
+            return
+
         started = time.monotonic()
         try:
-            try:
+            async with self._otii_lock:
                 await call_with_timeout(
                     self.otii_object.get_devices, timeout=self.settings["otii_call_timeout_seconds"]
                 )
-            except OtiiCommsTimeout:
-                await self._handle_otii_comms_lost("Otii stopped responding (idle health check)")
-                return
-            except Exception:
-                return
-
-            latency = time.monotonic() - started
-            if latency > self.settings["otii_call_timeout_seconds"] / 2:
-                self._set_otii_badge(f"● Otii: slow ({latency:.1f}s)", "#ffe6a6")
-            else:
-                self._set_otii_badge("● Otii: connected", "#a6ffcc")
+        except OtiiCommsTimeout:
+            await self._handle_otii_comms_lost("Otii stopped responding (idle health check)")
+            return
+        except Exception:
+            return
         finally:
             self._ping_in_flight = False
+
+        latency = time.monotonic() - started
+        if latency > self.settings["otii_call_timeout_seconds"] / 2:
+            self._set_otii_badge(f"● Otii: slow ({latency:.1f}s)", "#ffe6a6")
+        else:
+            self._set_otii_badge("● Otii: connected", "#a6ffcc")
 
     # ------------------------------------------------------------------
     # Comms-lost / auto-restart recovery
     # ------------------------------------------------------------------
 
     async def _handle_otii_comms_lost(self, reason: str):
-        self._measuring = False
-        self.otii_object = None
-        self.otii_project = None
-        self.otii_devices = []
-
-        def _lost_ui():
-            self._prog_row.hide()
-            self.btn_run.setEnabled(False)
-            self.btn_save.setEnabled(False)
-        self._on_main(_lost_ui)
-        self._set_otii_badge("● Otii: lost", "#ffcccc")
-
-        now = time.monotonic()
-        self._restart_timestamps = [t for t in self._restart_timestamps if now - t < self.AUTO_RESTART_WINDOW_S]
-
-        if len(self._restart_timestamps) >= self.MAX_AUTO_RESTARTS:
-            self.set_status(
-                f"{reason}. Otii has been auto-restarted {self.MAX_AUTO_RESTARTS} times recently — "
-                "click Connect to Otii manually after checking the app.",
-                "error",
-            )
-            self._reset_connect_button()
+        if self._recovering:
+            # Already mid-recovery from a previous comms-lost event (e.g.
+            # this got triggered from both the idle-watchdog ping and a
+            # measurement's own timeout landing close together) -- don't
+            # pile up a second concurrent taskkill/relaunch sequence
+            # (2026-09 adversarial review finding #7).
+            _log("warn", "comms_lost_reentry_skipped", reason=reason)
             return
-
-        exe_path = await self._resolve_otii_exe_path()
-        if exe_path is None:
-            self.set_status(
-                f"{reason}. Could not locate Otii 3.exe to restart it — set the path in Settings.",
-                "error",
-            )
-            self._reset_connect_button()
-            return
-
-        self._restart_timestamps.append(now)
-        self.set_status(f"{reason}. Restarting Otii app…", "warning")
+        self._recovering = True
         try:
-            restart_wait = self.settings["otii_restart_wait_seconds"]
-            await call_with_timeout(
-                restart_otii_app, exe_path, restart_wait, timeout=restart_wait + 20.0
-            )
-        except Exception as e:
-            msg = str(e)
-            self.set_status(f"Automatic Otii restart failed: {msg}. Restart it manually, then Connect.", "error")
-            self._reset_connect_button()
-            return
+            self._measuring = False
+            self.otii_object = None
+            self.otii_project = None
+            self.otii_devices = []
 
-        self.set_status(
-            "Otii restarted. Make sure the Arc Pro is connected/powered, then click Connect to Otii.",
-            "warning",
-        )
-        self._reset_connect_button()
+            def _lost_ui():
+                self._prog_row.hide()
+                self.btn_run.setEnabled(False)
+                self.btn_save.setEnabled(False)
+            self._on_main(_lost_ui)
+            self._set_otii_badge("● Otii: lost", "#ffcccc")
+
+            now = time.monotonic()
+            self._restart_timestamps = [t for t in self._restart_timestamps if now - t < self.AUTO_RESTART_WINDOW_S]
+
+            if len(self._restart_timestamps) >= self.MAX_AUTO_RESTARTS:
+                self.set_status(
+                    f"{reason}. Otii has been auto-restarted {self.MAX_AUTO_RESTARTS} times recently — "
+                    "click Connect to Otii manually after checking the app.",
+                    "error",
+                )
+                self._reset_connect_button()
+                return
+
+            exe_path = await self._resolve_otii_exe_path()
+            if exe_path is None:
+                self.set_status(
+                    f"{reason}. Could not locate Otii 3.exe to restart it — set the path in Settings.",
+                    "error",
+                )
+                self._reset_connect_button()
+                return
+
+            self._restart_timestamps.append(now)
+            self.set_status(f"{reason}. Restarting Otii app…", "warning")
+            try:
+                restart_wait = self.settings["otii_restart_wait_seconds"]
+                await call_with_timeout(
+                    restart_otii_app, exe_path, restart_wait, timeout=restart_wait + 20.0
+                )
+            except Exception as e:
+                msg = str(e)
+                self.set_status(f"Automatic Otii restart failed: {msg}. Restart it manually, then Connect.", "error")
+                self._reset_connect_button()
+                return
+
+            self.set_status(
+                "Otii restarted. Make sure the Arc Pro is connected/powered, then click Connect to Otii.",
+                "warning",
+            )
+            self._reset_connect_button()
+        finally:
+            self._recovering = False
 
     # ------------------------------------------------------------------
     # Measurement
@@ -2027,9 +2191,16 @@ class LowLightApp(QMainWindow):
             self._save_this_test()
 
     def _start_measurement(self):
+        # Disabling Connect too closes the window where a "Reconnect to
+        # Otii" click could otherwise run concurrently with this
+        # measurement's own Otii calls (2026-09 adversarial review finding
+        # #3/#6) -- belt-and-suspenders alongside self._otii_lock, which
+        # covers it even if some future code path forgets this button.
         self.btn_run.setEnabled(False)
+        self.btn_connect.setEnabled(False)
         if not self._launch_task(self._async_start_measurement()):
             self.btn_run.setEnabled(True)
+            self.btn_connect.setEnabled(True)
 
     def _read_panel_inputs(self):
         return (
@@ -2072,13 +2243,17 @@ class LowLightApp(QMainWindow):
         # scheduling this task, so every early-return path here must
         # re-enable it -- these two used to run before the button was ever
         # touched, but that's no longer true.
+        def _reenable_run_and_connect():
+            self.btn_run.setEnabled(True)
+            self.btn_connect.setEnabled(True)
+
         if self.otii_project is None or not self.otii_devices:
             self.set_status("No instrument connected", "error")
-            self._on_main(lambda: self.btn_run.setEnabled(True))
+            self._on_main(_reenable_run_and_connect)
             return
         if not panel_name:
             self.set_status("Panel Name is required before running a test", "warning")
-            self._on_main(lambda: self.btn_run.setEnabled(True))
+            self._on_main(_reenable_run_and_connect)
             return
 
         self._measuring = True
@@ -2099,70 +2274,92 @@ class LowLightApp(QMainWindow):
         sweep_timeout = self.settings["iv_timeout_seconds"]
 
         try:
-            isc_measured = await call_with_timeout(
-                short_circuit, self.otii_project, self.otii_devices, timeout=max(call_timeout, 15.0)
-            )
-            if isc_measured <= 0:
-                raise RuntimeError(f"Invalid Isc measured: {isc_measured}")
+            # Holds the same lock a connect/reconnect or an idle-watchdog
+            # ping would hold before touching the Otii connection, so
+            # neither can interleave with this measurement's own traffic on
+            # the same TCP socket (2026-09 adversarial review finding #3).
+            # Only wraps the actual Otii calls -- rendering/saving below
+            # doesn't need the connection, so it's done outside the lock.
+            async with self._otii_lock:
+                isc_measured = await call_with_timeout(
+                    short_circuit, self.otii_project, self.otii_devices, timeout=max(call_timeout, 15.0)
+                )
+                if isc_measured <= 0:
+                    raise RuntimeError(f"Invalid Isc measured: {isc_measured}")
 
-            current_step = (isc_measured / 150) * 1e6
-            if current_step <= 0:
-                raise RuntimeError(f"Invalid current step derived from Isc: {current_step}")
+                current_step = (isc_measured / 150) * 1e6
+                if current_step <= 0:
+                    raise RuntimeError(f"Invalid current step derived from Isc: {current_step}")
 
-            self.set_status("Sweeping IV curve…", "info")
+                self.set_status("Sweeping IV curve…", "info")
 
-            def _on_progress(fraction: float):
-                # Called from the worker thread harvest() runs in — must not
-                # touch Qt widgets directly, so route through a signal.
-                self._progress_bridge.progress.emit(fraction)
+                def _on_progress(fraction: float):
+                    # Called from the worker thread harvest() runs in —
+                    # must not touch Qt widgets directly, so route through
+                    # a signal.
+                    self._progress_bridge.progress.emit(fraction)
 
-            def _on_live_data(mv, mc):
-                # Also called from harvest()'s own thread -- it fetches this
-                # data itself, on its own single connection, throttled to
-                # ~once/second (see live_data_interval_s below), so this
-                # can never race harvest()'s own in-flight Otii requests.
-                # Best-effort: any failure here must never surface past this
-                # function, since it's a live preview, not the measurement.
-                try:
-                    mv_arr = np.asarray(mv, dtype=float)
-                    mc_arr = np.asarray(mc, dtype=float)
-                    window, skip = 25, 10
-                    if len(mv_arr) <= window + skip:
-                        return
-                    mv_smooth = moving_average(mv_arr, window)[:-skip]
-                    mc_smooth = -1 * moving_average(mc_arr, window)[:-skip]
+                def _on_live_data(mv, mc):
+                    # Also called from harvest()'s own thread -- it fetches
+                    # this data itself, on its own single connection,
+                    # throttled to ~once/second (see live_data_interval_s
+                    # below), so this can never race harvest()'s own
+                    # in-flight Otii requests. Best-effort: any failure here
+                    # must never surface past this function, since it's a
+                    # live preview, not the measurement.
+                    try:
+                        mv_arr = np.asarray(mv, dtype=float)
+                        mc_arr = np.asarray(mc, dtype=float)
+                        window, skip = 25, 10
+                        if len(mv_arr) <= window + skip:
+                            return
+                        mv_smooth = moving_average(mv_arr, window)[:-skip]
+                        mc_smooth = -1 * moving_average(mc_arr, window)[:-skip]
 
-                    def _draw_live():
-                        fig = self.canvas.figure
-                        fig.clf()
-                        ax = fig.add_subplot(111)
-                        ax.plot(mv_smooth, 1e6 * mc_smooth, color="#1a56db", linewidth=1.5)
-                        ax.set_xlabel("Voltage (V)")
-                        ax.set_ylabel("Current (uA)")
-                        ax.set_title("Sweeping IV curve… (live)")
-                        ax.grid(True)
-                        self.canvas.draw()
+                        def _draw_live():
+                            fig = self.canvas.figure
+                            fig.clf()
+                            ax = fig.add_subplot(111)
+                            ax.plot(mv_smooth, 1e6 * mc_smooth, color="#1a56db", linewidth=1.5)
+                            ax.set_xlabel("Voltage (V)")
+                            ax.set_ylabel("Current (uA)")
+                            ax.set_title("Sweeping IV curve… (live)")
+                            ax.grid(True)
+                            self.canvas.draw()
 
-                    self._on_main(_draw_live)
-                except Exception:
-                    pass
+                        self._on_main(_draw_live)
+                    except Exception:
+                        pass
 
-            recording = await call_with_timeout(
-                harvest,
-                self.otii_project,
-                self.otii_devices,
-                current_step,
-                sweep_timeout,
-                _on_progress,
-                _on_live_data,
-                timeout=sweep_timeout + max(call_timeout, 15.0),
-            )
+                recording = await call_with_timeout(
+                    harvest,
+                    self.otii_project,
+                    self.otii_devices,
+                    current_step,
+                    sweep_timeout,
+                    _on_progress,
+                    _on_live_data,
+                    timeout=sweep_timeout + max(call_timeout, 15.0),
+                )
 
-            my_arc = self.otii_devices[0]
+                my_arc = self.otii_devices[0]
+
+                # The network fetch stays inside the lock (and off the main
+                # thread, via call_with_timeout) -- this is the same
+                # unbounded-Otii-hang risk as start_recording/stop_recording,
+                # previously run straight on the Qt main thread with no
+                # timeout at all inside plot_iv_curve() (2026-09 adversarial
+                # review finding #2). Only the local render+save below
+                # (no network, just numpy/matplotlib/disk) goes on the main
+                # thread, and only after the data's already safely in hand.
+                mv_data_dict, mc_data_dict, mp_data_dict = await call_with_timeout(
+                    fetch_recording_channels, recording, my_arc,
+                    timeout=max(call_timeout, 15.0),
+                )
 
             def _render_and_draw():
-                result = plot_iv_curve(
-                    recording, my_arc, panel_name, si_text, light_meter,
+                result = render_iv_curve(
+                    mv_data_dict, mc_data_dict, mp_data_dict, panel_name, si_text, light_meter,
                     show_plot=False, fig=self.canvas.figure, out_dir=str(self.working_dir),
                 )
                 self.canvas.draw()
@@ -2188,7 +2385,7 @@ class LowLightApp(QMainWindow):
             self._on_main(lambda: self._prog_row.hide())
             self._measuring = False
             self.set_status(f"Measurement failed: {msg}", "error")
-            self._on_main(lambda: self.btn_run.setEnabled(True))
+            self._on_main(_reenable_run_and_connect)
             return
 
         marker[1] = time.time()
@@ -2196,6 +2393,7 @@ class LowLightApp(QMainWindow):
         self._measuring = False
         self._last_metrics = metrics
         self._last_measurement_window = (marker[0], marker[1])
+        self._on_main(lambda: self.btn_connect.setEnabled(True))
 
         # Blocking, inescapable prompt: a measurement without a recorded
         # panel temperature "makes the data point useless" (explicit
@@ -2206,6 +2404,22 @@ class LowLightApp(QMainWindow):
         # unresponsive to anything else while it's up.
         temp_value = await self._call_on_main(self._prompt_for_temp_blocking, panel_name)
         self._on_main(lambda: self.panel_temp_edit.setText(temp_value))
+
+        # Best-effort crash-recovery net: written the moment every field a
+        # summary-CSV row needs actually exists, so a crash or a forgotten
+        # "Save This Test" click doesn't silently discard a measurement that
+        # already went through the mandatory temp prompt (2026-09
+        # adversarial review finding #5). Cleared again once Save This Test
+        # actually succeeds -- see _save_this_test().
+        lux_value, _, _ = self.lux_live.snapshot()
+        irr_value, irr_count = self.irr_store.average()
+        pending_snapshot = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "lux": lux_value if lux_value is not None else 0.0,
+            "irradiance": irr_value if irr_value is not None else 0.0,
+            "samples": irr_count,
+        }
+        self._write_pending_measurement_snapshot(panel_name, light_meter, si_text, temp_value, metrics, pending_snapshot)
 
         def _finish_ui():
             self._prog_row.hide()
@@ -2220,21 +2434,101 @@ class LowLightApp(QMainWindow):
         self.set_status("Measurement complete — review the plot, then Save This Test", "success")
 
     # ------------------------------------------------------------------
+    # Pending-measurement crash-recovery snapshot
+    # ------------------------------------------------------------------
+
+    def _pending_measurement_path(self) -> Path:
+        return self.working_dir / PENDING_MEASUREMENT_FILENAME
+
+    def _write_pending_measurement_snapshot(self, panel_name, light_meter, si_text, temp_value, metrics, snapshot) -> None:
+        """Best-effort only -- must never break the measurement flow if the
+        working folder is briefly unwritable (e.g. OneDrive contention)."""
+        try:
+            payload = {
+                "panel_name": panel_name,
+                "light_meter": light_meter,
+                "irradiance_gui_input": si_text,
+                "panel_temp_c": temp_value,
+                "metrics": metrics,
+                "snapshot": snapshot,
+                "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            self._pending_measurement_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as e:
+            _log("warn", "pending_measurement_write_failed", error=str(e))
+
+    def _clear_pending_measurement_snapshot(self) -> None:
+        try:
+            path = self._pending_measurement_path()
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    def _check_pending_measurement_file(self, folder: Path) -> None:
+        """Called whenever the working folder is (re)opened. A leftover
+        file here means Save This Test never confirmed a previous
+        measurement -- its raw IV curve PNG/CSV are safe (written earlier,
+        during the measurement itself), but the enriched summary row
+        (temp, notes, lux/irr stats) never made it into the summary CSV."""
+        path = folder / PENDING_MEASUREMENT_FILENAME
+        if not path.exists():
+            return
+        panel, written_at = "?", "?"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            panel = data.get("panel_name", "?")
+            written_at = data.get("written_at", "?")
+        except Exception:
+            pass
+        self.set_status(
+            f"Found an unsaved measurement from a previous session ({panel}, {written_at}): {path} — "
+            "it was never confirmed with Save This Test, so it's not in the summary CSV yet. "
+            "Check the file for its recorded values, then delete it once handled.",
+            "warning",
+        )
+
+    # ------------------------------------------------------------------
     # Session table
     # ------------------------------------------------------------------
 
-    def _stdev_over_measurement(self, history: TimeSeriesBuffer):
-        """Standard deviation of a live-sensor history over the window of
-        the just-completed measurement (self._last_measurement_window, set
-        alongside self._last_metrics), for the Lux/Irr StdDev columns."""
+    def _windowed_values(self, history: TimeSeriesBuffer):
+        """Raw samples from a live-sensor history that fall within the
+        just-completed measurement's window (self._last_measurement_window,
+        set alongside self._last_metrics). Shared by the stdev/mean helpers
+        below so both are computed from the exact same sample set."""
         if self._last_measurement_window is None:
             return None
         start, end = self._last_measurement_window
         times, values = history.snapshot()
-        windowed = [v for t, v in zip(times, values) if start <= t <= end]
-        if len(windowed) < 2:
+        return [v for t, v in zip(times, values) if start <= t <= end]
+
+    def _stdev_over_measurement(self, history: TimeSeriesBuffer):
+        """Standard deviation of a live-sensor history over the just-
+        completed measurement's window, for the Lux/Irr StdDev columns."""
+        windowed = self._windowed_values(history)
+        if windowed is None or len(windowed) < 2:
             return None
         return float(np.std(windowed))
+
+    def _mean_over_measurement(self, history: TimeSeriesBuffer):
+        """Mean of a live-sensor history over the just-completed
+        measurement's window -- the denominator for the 3sigma/Avg %
+        columns, computed over the same samples as the stdev above."""
+        windowed = self._windowed_values(history)
+        if not windowed:
+            return None
+        return float(np.mean(windowed))
+
+    @staticmethod
+    def _three_sigma_pct(stdev, mean):
+        """What percentage of the average 3*stddev is -- a quick read on
+        how noisy a sensor was during the measurement relative to its own
+        level (e.g. 3 sigma at 30% of the mean is a much noisier reading
+        than 3 sigma at 2% of the mean, even with the same raw stdev)."""
+        if stdev is None or mean is None or mean == 0:
+            return None
+        return (3.0 * stdev / mean) * 100.0
 
     def _save_this_test(self):
         if self._last_metrics is None:
@@ -2262,6 +2556,10 @@ class LowLightApp(QMainWindow):
 
         lux_stdev = self._stdev_over_measurement(self.lux_history)
         irr_stdev = self._stdev_over_measurement(self.irr_store.history)
+        lux_mean = self._mean_over_measurement(self.lux_history)
+        irr_mean = self._mean_over_measurement(self.irr_store.history)
+        lux_3sigma_pct = self._three_sigma_pct(lux_stdev, lux_mean)
+        irr_3sigma_pct = self._three_sigma_pct(irr_stdev, irr_mean)
 
         try:
             summary_csv = self.settings["summary_csv"]
@@ -2284,14 +2582,28 @@ class LowLightApp(QMainWindow):
             panel_temp_c=self.panel_temp_edit.text().strip(),
             lux_stdev=lux_stdev if lux_stdev is not None else "",
             irradiance_stdev=irr_stdev if irr_stdev is not None else "",
+            lux_3sigma_pct=lux_3sigma_pct if lux_3sigma_pct is not None else "",
+            irradiance_3sigma_pct=irr_3sigma_pct if irr_3sigma_pct is not None else "",
         )
 
         try:
             append_summary_csv(self.settings["summary_csv"], row)
         except Exception as e:
-            self.set_status(f"Saved to table, but summary CSV write failed: {e}", "warning")
-        else:
-            self.set_status(f"Saved run {run_index} to {self.settings['summary_csv']}", "success")
+            # Leave _last_metrics/session_rows/btn_save untouched -- i.e.
+            # everything exactly as it was before this click -- so the
+            # operator can fix the problem (e.g. close the file if it's
+            # open in Excel, free up disk space) and click Save This Test
+            # again. Previously this branch still cleared _last_metrics and
+            # disabled Save, silently forfeiting the row with no retry path
+            # (2026-09 adversarial review finding #4).
+            self.set_status(
+                f"Save failed, nothing was written: {e}. Fix the problem, then click "
+                "Save This Test again.",
+                "error",
+            )
+            return
+
+        self.set_status(f"Saved run {run_index} to {self.settings['summary_csv']}", "success")
 
         self._next_run_index = run_index + 1
         copy_to_clipboard(build_clipboard_row(row))
@@ -2302,6 +2614,7 @@ class LowLightApp(QMainWindow):
 
         self._last_metrics = None
         self.btn_save.setEnabled(False)
+        self._clear_pending_measurement_snapshot()
 
     def _append_table_row(self, row: dict):
         self.table.blockSignals(True)
@@ -2327,8 +2640,10 @@ class LowLightApp(QMainWindow):
             row.get("panel_temp_c", ""),
             f"{row.get('lux_measured', ''):.3f}" if row.get("lux_measured") not in ("", None) else "",
             f"{row.get('lux_stdev', ''):.3f}" if row.get("lux_stdev") not in ("", None) else "",
+            f"{row.get('lux_3sigma_pct', ''):.1f}" if row.get("lux_3sigma_pct") not in ("", None) else "",
             f"{row.get('irradiance_measured_live', ''):.6f}" if row.get("irradiance_measured_live") not in ("", None) else "",
             f"{row.get('irradiance_stdev', ''):.6f}" if row.get("irradiance_stdev") not in ("", None) else "",
+            f"{row.get('irradiance_3sigma_pct', ''):.1f}" if row.get("irradiance_3sigma_pct") not in ("", None) else "",
             row.get("notes", ""),
         ]
         for col, value in enumerate(values):
@@ -2403,8 +2718,34 @@ class LowLightApp(QMainWindow):
         self.set_status("Session cleared", "info")
 
 
+class _SafeApplication(QApplication):
+    """QApplication.notify() is where Qt's C++ event loop calls back into a
+    Python slot (button clicks, table-item-changed, filter changes, hover,
+    ...) -- letting a Python exception propagate out through it is what
+    aborts PyQt6 outright (this project hit exactly that crash earlier, see
+    the AsyncWorker comment above). _launch_task() already guards the
+    handful of slots that schedule an async task this way; overriding
+    notify() extends the same net to every other plain slot too (2026-09
+    adversarial review finding #8) -- a last resort, not a substitute for
+    each slot handling its own expected failures."""
+
+    def notify(self, receiver, event) -> bool:
+        try:
+            return super().notify(receiver, event)
+        except Exception as e:
+            _log("error", "unhandled_slot_exception", error=str(e))
+            try:
+                for widget in self.topLevelWidgets():
+                    if isinstance(widget, LowLightApp):
+                        widget.set_status(f"Internal error (caught): {e}", "error")
+                        break
+            except Exception:
+                pass
+            return False
+
+
 def main():
-    app = QApplication(sys.argv)
+    app = _SafeApplication(sys.argv)
     window = LowLightApp()
     window.showMaximized()
 

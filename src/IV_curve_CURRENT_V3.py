@@ -392,6 +392,8 @@ def append_summary_csv(csv_path, row_values):
         "panel_temp_c",
         "lux_stdev",
         "irradiance_stdev",
+        "lux_3sigma_pct",
+        "irradiance_3sigma_pct",
     ]
 
     file_exists = csv_file.exists()
@@ -443,7 +445,13 @@ def save_campaign_state(state_path, state):
         json.dump(state, fh, indent=2)
 
 
-def plot_iv_curve(recording, my_arc, panel_id, solar_intensity, light_meter, show_plot=True, fig=None, out_dir=None):
+def fetch_recording_channels(recording, my_arc):
+    """The network-bound half of plot_iv_curve(): pulls the mv/mc/mp channel
+    data for a completed recording from Otii. Split out so a caller that
+    needs to keep this off a UI thread (it's an unbounded Otii TCP
+    round-trip, same hang risk as start_recording/stop_recording) can run it
+    via its own timeout/threading and hand the result to render_iv_curve()
+    -- see low_light_app.py's _async_start_measurement()."""
     mv_samples = recording.get_channel_data_count(my_arc.id, "mv")
     mv_data_dict = recording.get_channel_data(my_arc.id, "mv", 0, mv_samples)
     mc_data_dict = recording.get_channel_data(my_arc.id, "mc", 0, mv_samples)
@@ -452,6 +460,19 @@ def plot_iv_curve(recording, my_arc, panel_id, solar_intensity, light_meter, sho
     if "values" not in mv_data_dict or "values" not in mc_data_dict:
         raise RuntimeError("Data retrieval failed. Please check the recording and connection.")
 
+    return mv_data_dict, mc_data_dict, mp_data_dict
+
+
+def render_iv_curve(
+    mv_data_dict, mc_data_dict, mp_data_dict, panel_id, solar_intensity, light_meter,
+    show_plot=True, fig=None, out_dir=None,
+):
+    """The local (no network) half of plot_iv_curve(): computes metrics,
+    plots, and saves the PNG/CSV from already-fetched channel data. Pure
+    number-crunching + file I/O -- safe to run wherever the caller likes
+    (this is the part low_light_app.py runs on the Qt main thread, since it
+    touches the shared canvas Figure, once fetch_recording_channels() has
+    already gotten the data off the network on another thread)."""
     mv_data = np.array(mv_data_dict["values"])
     mc_data = np.array(mc_data_dict["values"])
     mp_data = np.array(mp_data_dict["values"])
@@ -556,6 +577,17 @@ def plot_iv_curve(recording, my_arc, panel_id, solar_intensity, light_meter, sho
         "Voc": voc,
         "Isc": isc,
     }
+
+
+def plot_iv_curve(recording, my_arc, panel_id, solar_intensity, light_meter, show_plot=True, fig=None, out_dir=None):
+    """Convenience wrapper combining fetch_recording_channels() +
+    render_iv_curve() for callers (the CLI campaign flow) that don't need
+    the network fetch off any particular thread."""
+    mv_data_dict, mc_data_dict, mp_data_dict = fetch_recording_channels(recording, my_arc)
+    return render_iv_curve(
+        mv_data_dict, mc_data_dict, mp_data_dict, panel_id, solar_intensity, light_meter,
+        show_plot=show_plot, fig=fig, out_dir=out_dir,
+    )
 
 
 def derive_panel_type(panel_name):
@@ -682,6 +714,8 @@ def make_row(
     panel_temp_c="",
     lux_stdev="",
     irradiance_stdev="",
+    lux_3sigma_pct="",
+    irradiance_3sigma_pct="",
 ):
     row = {
         "session_id": session_id,
@@ -705,6 +739,8 @@ def make_row(
         "panel_temp_c": panel_temp_c,
         "lux_stdev": lux_stdev,
         "irradiance_stdev": irradiance_stdev,
+        "lux_3sigma_pct": lux_3sigma_pct,
+        "irradiance_3sigma_pct": irradiance_3sigma_pct,
         "source": "iv_curve_current_v3",
     }
 
