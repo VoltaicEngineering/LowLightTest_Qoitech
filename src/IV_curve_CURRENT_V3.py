@@ -235,7 +235,15 @@ def short_circuit(active_proj, my_arcs):
     return float(Isc)
 
 
-def harvest(active_proj, my_arcs, current_step, timeout_seconds=50.0):
+def harvest(
+    active_proj,
+    my_arcs,
+    current_step,
+    timeout_seconds=50.0,
+    progress_cb=None,
+    live_data_cb=None,
+    live_data_interval_s=1.0,
+):
     atexit.register(cleanup, my_arcs)
     for my_arc in my_arcs:
         my_arc.set_main_current(0)
@@ -258,9 +266,29 @@ def harvest(active_proj, my_arcs, current_step, timeout_seconds=50.0):
 
         ready = []
         started = time.monotonic()
+        last_live_fetch = 0.0
         for current_uA in range(0, int(SETTING["max_sink_current"]), int(current_step)):
-            if (time.monotonic() - started) > timeout_seconds:
+            now = time.monotonic()
+            if (now - started) > timeout_seconds:
                 raise TimeoutError(f"IV measurement timeout after {timeout_seconds:.1f}s")
+
+            if progress_cb is not None:
+                progress_cb(current_uA / SETTING["max_sink_current"])
+
+            if live_data_cb is not None and (now - last_live_fetch) >= live_data_interval_s:
+                last_live_fetch = now
+                try:
+                    # Best-effort only: runs on this same thread/connection,
+                    # never a separate one, so it can't race the sweep's own
+                    # requests -- but a live-preview hiccup must still never
+                    # break the actual measurement.
+                    sample_count = recording.get_channel_data_count(my_arcs[0].id, "mv")
+                    if sample_count > 0:
+                        mv_live = recording.get_channel_data(my_arcs[0].id, "mv", 0, sample_count)["values"]
+                        mc_live = recording.get_channel_data(my_arcs[0].id, "mc", 0, sample_count)["values"]
+                        live_data_cb(mv_live, mc_live)
+                except Exception:
+                    pass
 
             for my_arc in my_arcs:
                 my_arc.set_main_current(-current_uA * 1e-6)
@@ -274,6 +302,9 @@ def harvest(active_proj, my_arcs, current_step, timeout_seconds=50.0):
                 break
 
             time.sleep(SETTING["interval"])
+
+        if progress_cb is not None:
+            progress_cb(1.0)
 
         return recording
     finally:
@@ -358,6 +389,9 @@ def append_summary_csv(csv_path, row_values):
         "notes",
         "error",
         "source",
+        "panel_temp_c",
+        "lux_stdev",
+        "irradiance_stdev",
     ]
 
     file_exists = csv_file.exists()
@@ -409,7 +443,7 @@ def save_campaign_state(state_path, state):
         json.dump(state, fh, indent=2)
 
 
-def plot_iv_curve(recording, my_arc, panel_id, solar_intensity, light_meter, show_plot=True):
+def plot_iv_curve(recording, my_arc, panel_id, solar_intensity, light_meter, show_plot=True, fig=None, out_dir=None):
     mv_samples = recording.get_channel_data_count(my_arc.id, "mv")
     mv_data_dict = recording.get_channel_data(my_arc.id, "mv", 0, mv_samples)
     mc_data_dict = recording.get_channel_data(my_arc.id, "mc", 0, mv_samples)
@@ -439,8 +473,14 @@ def plot_iv_curve(recording, my_arc, panel_id, solar_intensity, light_meter, sho
     isc = float(np.max(mc_data))
     ff = 0.0 if (isc * voc) == 0 else (max_power / (isc * voc))
 
-    fig, ax1 = plt.subplots(figsize=(1680 / 100, 920 / 100))
-    plt.xlabel("Voltage (V)")
+    owns_fig = fig is None
+    if owns_fig:
+        fig, ax1 = plt.subplots(figsize=(1680 / 100, 920 / 100))
+    else:
+        fig.clf()
+        ax1 = fig.add_subplot(111)
+
+    ax1.set_xlabel("Voltage (V)")
     ax1.set_ylabel("Current (uA)", color="blue")
     ax1.plot(mv_data, 1e6 * mc_data, color="blue", label="Current (uA)")
     ax1.tick_params(axis="y", labelcolor="blue")
@@ -462,11 +502,13 @@ def plot_iv_curve(recording, my_arc, panel_id, solar_intensity, light_meter, sho
     ax2.legend(loc="upper center")
     ax1.yaxis.label.set_color("blue")
     ax2.yaxis.label.set_color("red")
-    plt.title(f"I-V Curve: {panel_id} at {solar_intensity} W/m2\nLightmeter Cal.: {light_meter}")
+    ax1.set_title(f"I-V Curve: {panel_id} at {solar_intensity} W/m2\nLightmeter Cal.: {light_meter}")
 
-    text_x = plt.xlim()[0] + (1 / 16) * (plt.xlim()[1] - plt.xlim()[0])
-    text_y = plt.ylim()[1] - (3 / 9) * (plt.ylim()[1] - plt.ylim()[0])
-    plt.text(
+    xlim = ax1.get_xlim()
+    ylim = ax1.get_ylim()
+    text_x = xlim[0] + (1 / 16) * (xlim[1] - xlim[0])
+    text_y = ylim[1] - (3 / 9) * (ylim[1] - ylim[0])
+    ax1.text(
         text_x,
         text_y,
         (
@@ -482,18 +524,23 @@ def plot_iv_curve(recording, my_arc, panel_id, solar_intensity, light_meter, sho
     )
 
     timestamp = time.strftime("%Y-%m-%d-%H-%M")
-    plt.savefig(f"{timestamp} Panel {panel_id} SI {solar_intensity}.png")
+    out_path = Path(out_dir) if out_dir else Path(".")
+    out_path.mkdir(parents=True, exist_ok=True)
+    png_path = out_path / f"{timestamp} Panel {panel_id} SI {solar_intensity}.png"
+    csv_path = out_path / f"{timestamp} Panel {panel_id} SI {solar_intensity}.csv"
+    fig.savefig(png_path)
     np.savetxt(
-        f"{timestamp} Panel {panel_id} SI {solar_intensity}.csv",
+        csv_path,
         np.column_stack((mv_data, mc_data, power_data)),
         delimiter=",",
         header="Voltage (V), Current (A), Power (W)",
         comments="",
     )
-    if show_plot:
-        plt.show()
-    else:
-        plt.close(fig)
+    if owns_fig:
+        if show_plot:
+            plt.show()
+        else:
+            plt.close(fig)
 
     print(f"i_sc: {1e6 * isc:.2f} uA")
     print(f"i_mpp: {1e6 * max_current:.2f} uA")
@@ -621,7 +668,21 @@ def run_single_measurement(args, active_proj, devices, panel_name, gui_irradianc
     return metrics, snapshot
 
 
-def make_row(session_id, run_index, status, panel_name, light_meter, gui_irradiance_input, notes, metrics=None, snapshot=None, error=""):
+def make_row(
+    session_id,
+    run_index,
+    status,
+    panel_name,
+    light_meter,
+    gui_irradiance_input,
+    notes,
+    metrics=None,
+    snapshot=None,
+    error="",
+    panel_temp_c="",
+    lux_stdev="",
+    irradiance_stdev="",
+):
     row = {
         "session_id": session_id,
         "run_index": run_index,
@@ -641,6 +702,9 @@ def make_row(session_id, run_index, status, panel_name, light_meter, gui_irradia
         "Isc": "",
         "notes": notes,
         "error": error,
+        "panel_temp_c": panel_temp_c,
+        "lux_stdev": lux_stdev,
+        "irradiance_stdev": irradiance_stdev,
         "source": "iv_curve_current_v3",
     }
 
