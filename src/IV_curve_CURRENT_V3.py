@@ -23,6 +23,22 @@ from otii_tcp_client import otii_connection, otii
 HOST = {"IP": "127.0.0.1", "PORT": 1905}
 SETTING = {"max_sink_current": 500e6, "interval": 105.333e-3}
 
+# Adaptive sweep pacing (harvest()): the inter-step delay starts at
+# SETTING["interval"] (the historically-known-safe pace) and adjusts from
+# there based on how long each step's own Otii round trip actually takes --
+# AIMD-style, like TCP congestion control: back off quickly (multiplicative)
+# the moment Otii looks like it's struggling to keep up, speed up slowly
+# (a few % at a time) while it's comfortably keeping pace. This is what
+# protects against the hang the operator observed when commands are sent
+# too fast for Otii to keep up with, while also letting most of the sweep
+# run faster than the old fixed 105ms/step once Otii proves it can keep up.
+ADAPTIVE_INTERVAL_MIN_S = 0.02
+ADAPTIVE_INTERVAL_MAX_S = 0.5
+ADAPTIVE_SPEEDUP_FACTOR = 0.95
+ADAPTIVE_BACKOFF_FACTOR = 2.0
+ADAPTIVE_FAST_RATIO = 0.4
+ADAPTIVE_SLOW_RATIO = 0.8
+
 proj = None
 Isc = None
 
@@ -243,7 +259,19 @@ def harvest(
     progress_cb=None,
     live_data_cb=None,
     live_data_interval_s=1.0,
+    expected_max_current_uA=None,
 ):
+    if expected_max_current_uA is None or expected_max_current_uA <= 0:
+        # Callers derive current_step from Isc as current_step = Isc/150
+        # (see run_single_measurement()/_async_start_measurement()), so a
+        # full sweep is ~150 steps -- i.e. current_uA naturally tops out
+        # around current_step*150, NOT SETTING["max_sink_current"] (500A).
+        # The sweep always terminates at the voltage cutoff, far below
+        # 500A, so using that as the progress denominator made the
+        # progress bar sit at ~0% for the entire sweep and only jump to
+        # 100% at the very end (2026-09 feedback: "progress bar not
+        # working").
+        expected_max_current_uA = current_step * 150.0
     atexit.register(cleanup, my_arcs)
     for my_arc in my_arcs:
         my_arc.set_main_current(0)
@@ -267,13 +295,14 @@ def harvest(
         ready = []
         started = time.monotonic()
         last_live_fetch = 0.0
+        interval = SETTING["interval"]
         for current_uA in range(0, int(SETTING["max_sink_current"]), int(current_step)):
             now = time.monotonic()
             if (now - started) > timeout_seconds:
                 raise TimeoutError(f"IV measurement timeout after {timeout_seconds:.1f}s")
 
             if progress_cb is not None:
-                progress_cb(current_uA / SETTING["max_sink_current"])
+                progress_cb(min(1.0, current_uA / expected_max_current_uA))
 
             if live_data_cb is not None and (now - last_live_fetch) >= live_data_interval_s:
                 last_live_fetch = now
@@ -290,18 +319,29 @@ def harvest(
                 except Exception:
                     pass
 
+            step_started = time.monotonic()
             for my_arc in my_arcs:
                 my_arc.set_main_current(-current_uA * 1e-6)
-                if my_arc.get_value("mv") < 0.15:
+                if my_arc.get_value("mv") < 0.2:
                     my_arc.set_main(False)
                     my_arc.set_main_current(0)
                     my_arc.set_power_regulation("voltage")
                     ready.append(my_arc.id)
+            call_latency = time.monotonic() - step_started
 
             if len(ready) >= len(my_arcs):
                 break
 
-            time.sleep(SETTING["interval"])
+            if call_latency > ADAPTIVE_SLOW_RATIO * interval:
+                # Otii's own round trip is eating most (or more) of our
+                # pacing budget -- back off decisively rather than risk
+                # piling commands up faster than it can process them.
+                interval = min(ADAPTIVE_INTERVAL_MAX_S, max(interval * ADAPTIVE_BACKOFF_FACTOR, call_latency * 1.5))
+            elif call_latency < ADAPTIVE_FAST_RATIO * interval:
+                # Comfortably keeping up -- ease the pace up a little.
+                interval = max(ADAPTIVE_INTERVAL_MIN_S, interval * ADAPTIVE_SPEEDUP_FACTOR)
+
+            time.sleep(interval)
 
         if progress_cb is not None:
             progress_cb(1.0)
