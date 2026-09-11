@@ -1900,10 +1900,18 @@ class LowLightApp(QMainWindow):
             self.lux_badge.setText("● Lux: --")
             self.lux_badge.setStyleSheet("color:#ffe6a6; font-size:11pt; font-weight:bold; background:transparent;")
 
-        irr_value, irr_count = self.irr_store.average()
-        irr_is_live = irr_value is not None
+        # The live number tracks the single most recent raw sample (like
+        # Lux above), NOT irr_store.average()'s 10s rolling mean -- that
+        # average is still exactly right for a *saved* measurement (see
+        # _windowed_stats), but for the live readout it made the number lag
+        # a real step change by several seconds while the graph next to it
+        # (plotted from the same raw samples) showed it instantly. Video
+        # review (2026-09) confirmed irradiance lagging visibly behind its
+        # own graph while lux -- already latest-sample-based -- did not.
+        irr_value, irr_ts = self.irr_store.latest()
+        irr_is_live = irr_value is not None and (irr_ts is None or now - irr_ts <= LIVE_STALE_S)
         if irr_is_live:
-            self.irr_value_lbl.setText(f"{irr_value:.4f} W/m² ({irr_count} smp)")
+            self.irr_value_lbl.setText(f"{irr_value:.4f} W/m²")
             self.irr_badge.setText("● Irr: live")
             self.irr_badge.setStyleSheet("color:#a6ffcc; font-size:11pt; font-weight:bold; background:transparent;")
         else:
@@ -2530,22 +2538,21 @@ class LowLightApp(QMainWindow):
         times, values = history.snapshot()
         return [v for t, v in zip(times, values) if start <= t <= end]
 
-    def _stdev_over_measurement(self, history: TimeSeriesBuffer):
-        """Standard deviation of a live-sensor history over the just-
-        completed measurement's window, for the Lux/Irr StdDev columns."""
-        windowed = self._windowed_values(history)
-        if windowed is None or len(windowed) < 2:
-            return None
-        return float(np.std(windowed))
-
-    def _mean_over_measurement(self, history: TimeSeriesBuffer):
-        """Mean of a live-sensor history over the just-completed
-        measurement's window -- the denominator for the 3sigma/Avg %
-        columns, computed over the same samples as the stdev above."""
+    def _windowed_stats(self, history: TimeSeriesBuffer):
+        """(count, mean, stdev) for a live-sensor history over the just-
+        completed measurement's window, computed from a single snapshot so
+        all three are consistent with each other. This is what
+        _save_this_test() actually records as the Lux/Irradiance value --
+        NOT a live reading taken at the moment Save is clicked, which used
+        to drift from what the sensor actually saw during the sweep itself
+        depending on how long the operator took to get there (e.g. through
+        the mandatory temp prompt) (2026-09 feedback)."""
         windowed = self._windowed_values(history)
         if not windowed:
-            return None
-        return float(np.mean(windowed))
+            return 0, None, None
+        mean = float(np.mean(windowed))
+        stdev = float(np.std(windowed)) if len(windowed) >= 2 else None
+        return len(windowed), mean, stdev
 
     @staticmethod
     def _three_sigma_pct(stdev, mean):
@@ -2561,32 +2568,38 @@ class LowLightApp(QMainWindow):
         if self._last_metrics is None:
             return
 
-        irr_value, irr_count = self.irr_store.average()
+        # Lux/irradiance are recorded from what the sensors actually saw
+        # DURING the measurement's own window (start of Isc to end of the
+        # sweep), not a live reading taken at the moment Save is clicked --
+        # the latter used to drift depending on how long the operator took
+        # to get here (e.g. through the mandatory temp prompt), so the
+        # saved value didn't necessarily reflect the sweep at all (2026-09
+        # feedback).
+        irr_count, irr_mean, irr_stdev = self._windowed_stats(self.irr_store.history)
         if irr_count < MIN_IRR_SAMPLES:
+            window = self._last_measurement_window
+            duration_s = (window[1] - window[0]) if window else 0.0
             resp = QMessageBox.question(
                 self,
                 "Low sample count",
-                f"Only {irr_count} irradiance samples in the last {IRR_WINDOW_S:.0f}s window "
-                f"(minimum {MIN_IRR_SAMPLES}). Save this row anyway?",
+                f"Only {irr_count} irradiance sample(s) were captured during the "
+                f"{duration_s:.1f}s measurement itself (minimum {MIN_IRR_SAMPLES}). "
+                "Save this row anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if resp != QMessageBox.StandardButton.Yes:
                 return
 
-        lux_value, _, _ = self.lux_live.snapshot()
-        snapshot = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "lux": lux_value if lux_value is not None else 0.0,
-            "irradiance": irr_value if irr_value is not None else 0.0,
-            "samples": irr_count,
-        }
-
-        lux_stdev = self._stdev_over_measurement(self.lux_history)
-        irr_stdev = self._stdev_over_measurement(self.irr_store.history)
-        lux_mean = self._mean_over_measurement(self.lux_history)
-        irr_mean = self._mean_over_measurement(self.irr_store.history)
+        _lux_count, lux_mean, lux_stdev = self._windowed_stats(self.lux_history)
         lux_3sigma_pct = self._three_sigma_pct(lux_stdev, lux_mean)
         irr_3sigma_pct = self._three_sigma_pct(irr_stdev, irr_mean)
+
+        snapshot = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "lux": lux_mean if lux_mean is not None else 0.0,
+            "irradiance": irr_mean if irr_mean is not None else 0.0,
+            "samples": irr_count,
+        }
 
         try:
             summary_csv = self.settings["summary_csv"]
