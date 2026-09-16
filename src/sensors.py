@@ -41,7 +41,24 @@ TIMESERIES_HISTORY_S = 600.0  # how much lux/irradiance history the timeseries p
 TIMESERIES_REDRAW_MS = 400
 
 
+_LOG_LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40}
+_LOG_MIN_LEVEL = _LOG_LEVELS["info"]
+
+
 def _log(level: str, event: str, **fields) -> None:
+    """Gate on level like listen.py's own should_log() does for its CLI entry
+    point -- unlike that path, callers here (lux_poll_loop, and serial_reader
+    wired up from a GUI app's sensor-connect code) never filtered at all, so
+    every single irradiance sample's "debug" sample_captured event hit
+    print() unthrottled. At any real sample rate that's enough print()/console
+    I/O to starve the reader thread of the GIL, letting the OS-level serial
+    receive buffer build a backlog -- so "latest" reading drifts further and
+    further behind wall-clock time the longer a session runs, which is
+    exactly the growing lux/irradiance lag reported in the calibration app's
+    non-simulate mode. Debug-level spam is silenced; connection/error events
+    (info and above) still print."""
+    if _LOG_LEVELS.get(level, _LOG_LEVELS["info"]) < _LOG_MIN_LEVEL:
+        return
     log_event(level, event, **fields)
 
 

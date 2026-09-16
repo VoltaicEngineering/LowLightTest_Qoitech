@@ -66,8 +66,9 @@ from matplotlib.figure import Figure
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import norm_analysis
+import sensors
 from triplett_lt68_probe_v3 import LT68
-from listen import RollingIrradiance, serial_reader, log_event
+from listen import RollingIrradiance, serial_reader
 from sensors import (
     CACHE_DIR,
     LUX_TIMEOUT_S,
@@ -126,7 +127,7 @@ _FIELD_MAP = {0: "panel_name", 7: "light_meter", 8: "irradiance_gui_input", 9: "
 
 
 def _log(level: str, event: str, **fields) -> None:
-    log_event(level, event, **fields)
+    sensors._log(level, event, **fields)
 
 
 # ---------------------------------------------------------------------------
