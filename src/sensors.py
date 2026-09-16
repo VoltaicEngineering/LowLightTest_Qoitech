@@ -195,6 +195,24 @@ class HistoryIrradiance(RollingIrradiance):
         self.history.add(value)
 
 
+# get_lux()/get_lux_reading() don't just correct a wrong range -- on every
+# single call they also actively hunt for the *most precise* range available
+# (LT68._maybe_better_lower_lux_range), switching whenever a smaller range
+# would also comfortably fit. Each range step costs ~2 settle delays
+# (~0.5-0.6s) plus extra round trips. Polling that every 0.3s is cheap once
+# the light level is stable (it quickly finds the best range and stays put),
+# but while the level is actually changing -- lamps switching on, or the
+# sensor moving to a grid node with a very different brightness -- the
+# "optimize for precision" logic keeps re-triggering on almost every poll,
+# each one blocking the poll loop for another ~0.5s+, so the on-screen
+# reading stalls in bursts for several seconds exactly while it matters most.
+# Below, routine polling uses the cheap read_live() (single round trip, no
+# forced sleeps) and only escalates to the full, slower autorange machinery
+# when the current range is actually wrong (overloaded, or precision is
+# clearly poor) rather than merely "not the most precise possible".
+_LUX_PRECISION_FLOOR_COUNTS = 400  # ~10% of the 4000-count display
+
+
 def lux_poll_loop(port: str, live: LiveValue, stop_event: threading.Event, history: TimeSeriesBuffer | None = None) -> None:
     """Background loop polling the Triplett LT68, mirroring the reconnect
     backoff pattern in listen.py's run_periodic_logger()."""
@@ -215,7 +233,15 @@ def lux_poll_loop(port: str, live: LiveValue, stop_event: threading.Event, histo
                 continue
 
         try:
-            value = meter.get_lux(settle=LUX_SETTLE_S)
+            reading = meter.read_live()
+            needs_autorange = (
+                reading.unit != "lux"
+                or reading.hold == "hold"
+                or reading.mode in {"max", "min", "Pmax", "Pmin"}
+                or reading.overloaded
+                or abs(reading.display_counts) < _LUX_PRECISION_FLOOR_COUNTS
+            )
+            value = meter.get_lux(settle=LUX_SETTLE_S) if needs_autorange else reading.lux_value
             live.set(value)
             if history is not None:
                 history.add(value)
