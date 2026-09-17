@@ -290,16 +290,18 @@ def active_captures(captures: list[dict]) -> list[dict]:
     return [c for c in captures if not c.get("superseded")]
 
 
-def mark_superseded(csv_path, capture_id: str) -> bool:
-    """Flip superseded=1 on the row with this capture_id. CSV is append-only
-    in spirit (no row is ever deleted or has its measured values changed);
-    this is the one exception, and it requires rewriting the file since CSV
-    has no in-place row update. Returns True if a row was updated."""
+def mark_superseded(csv_path, capture_id: str, superseded: bool = True) -> bool:
+    """Flip the superseded flag on the row with this capture_id (True, the
+    default, to retire it on a redo; False to restore it, e.g. undoing an
+    accidental redo). CSV is append-only in spirit (no row is ever deleted or
+    has its measured values changed); this flag is the one exception, and it
+    requires rewriting the file since CSV has no in-place row update. Returns
+    True if a row was updated."""
     rows = _read_captures_raw(csv_path)
     changed = False
     for row in rows:
         if row.get("capture_id") == capture_id:
-            row["superseded"] = "1"
+            row["superseded"] = "1" if superseded else "0"
             changed = True
     if not changed:
         return False

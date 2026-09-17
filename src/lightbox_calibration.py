@@ -267,6 +267,7 @@ class LightboxCalibrationApp(QMainWindow):
         self.capture_samples: list[float] = []
         self.capture_start_ts = 0.0
         self.last_capture_id: str | None = None
+        self._undo_snapshot: dict | None = None
 
         # Sensor state -- same classes used by low_light_app, whether fed by
         # real hardware threads or (in --simulate) a QTimer-driven synthetic
@@ -684,6 +685,8 @@ class LightboxCalibrationApp(QMainWindow):
         self.grid = cm.grid_from_campaign(config)
         self.captures_csv = cm.captures_csv_path(campaign_dir)
         self.captures_cache = cm.read_captures(self.captures_csv)
+        self._undo_snapshot = None
+        self.undo_redo_btn.setEnabled(False)
         self.run_grid.set_grid(self.grid)
         self.setup_grid.set_grid(self.grid)
         self.run_grid.reference_node = config["reference_node"]
@@ -1008,6 +1011,15 @@ class LightboxCalibrationApp(QMainWindow):
         btn_row2.addWidget(end_pass_btn)
         play.addLayout(btn_row2)
 
+        self.undo_redo_btn = QPushButton("Undo Last Redo")
+        self.undo_redo_btn.setToolTip(
+            "Restores whatever was just redone (Redo Last, a right-click node redo, or "
+            "Redo This Pass) -- only the single most recent redo can be undone."
+        )
+        self.undo_redo_btn.setEnabled(False)
+        self.undo_redo_btn.clicked.connect(self._guard(self._undo_last_redo))
+        play.addWidget(self.undo_redo_btn)
+
         play.addStretch()
         split.addWidget(panel)
         split.setSizes([700, 400])
@@ -1255,11 +1267,24 @@ class LightboxCalibrationApp(QMainWindow):
         box.exec()
 
         if box.clickedButton() is redo_btn:
-            for c in cm.active_captures(self.captures_cache):
-                if c["level_index"] == level_index and c["quantity"] == quantity:
-                    cm.mark_superseded(self.captures_csv, c["capture_id"])
-            self.captures_cache = cm.read_captures(self.captures_csv)
-            self._rebuild_run_grid()
+            ids_to_supersede = [
+                c["capture_id"] for c in cm.active_captures(self.captures_cache)
+                if c["level_index"] == level_index and c["quantity"] == quantity
+            ]
+            confirm = QMessageBox.question(
+                self, "Redo this pass?",
+                f"This discards all {len(ids_to_supersede)} captures for this {quantity.upper()} "
+                "pass (reference + grid nodes). The data stays on disk and Undo Last Redo can "
+                "restore it, but only until your next redo action. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                self._record_undo_snapshot(level_index, quantity, ids_to_supersede)
+                for capture_id in ids_to_supersede:
+                    cm.mark_superseded(self.captures_csv, capture_id)
+                self.captures_cache = cm.read_captures(self.captures_csv)
+                self._rebuild_run_grid()
 
         self._advance_cursor()
 
@@ -1291,10 +1316,65 @@ class LightboxCalibrationApp(QMainWindow):
 
     # -- Secondary capture controls -----------------------------------------
 
+    def _record_undo_snapshot(self, level_index: int, quantity: str, superseded_ids: list[str]) -> None:
+        """Remember exactly what a redo action is about to supersede, plus
+        which capture_ids already exist at this moment, so _undo_last_redo()
+        can both restore the old rows and discard anything captured during
+        the (mistaken) redo attempt itself. Must be called before the
+        supersede loop runs, while self.captures_cache still reflects the
+        pre-redo state. Only the single most recent redo is undoable -- a
+        later redo action overwrites this snapshot."""
+        self._undo_snapshot = {
+            "level_index": level_index,
+            "quantity": quantity,
+            "superseded_ids": list(superseded_ids),
+            "known_ids_before": {c["capture_id"] for c in self.captures_cache},
+        }
+        self.undo_redo_btn.setEnabled(True)
+
+    def _undo_last_redo(self) -> None:
+        snap = self._undo_snapshot
+        if not snap:
+            self.set_status("Nothing to undo.", "warning")
+            return
+
+        # Discard anything captured during the redo attempt being reversed --
+        # otherwise it would sit alongside the restored originals as a second
+        # active row for the same node.
+        for c in cm.active_captures(self.captures_cache):
+            if (
+                c["level_index"] == snap["level_index"]
+                and c["quantity"] == snap["quantity"]
+                and c["capture_id"] not in snap["known_ids_before"]
+            ):
+                cm.mark_superseded(self.captures_csv, c["capture_id"])
+
+        for capture_id in snap["superseded_ids"]:
+            cm.mark_superseded(self.captures_csv, capture_id, superseded=False)
+
+        self._undo_snapshot = None
+        self.undo_redo_btn.setEnabled(False)
+        self.captures_cache = cm.read_captures(self.captures_csv)
+        self._rebuild_run_grid()
+        self.cursor = cm.next_cursor(
+            self.captures_cache, self.grid, self.config["reference_node"],
+            current_level_index=self.current_level_index,
+        )
+        if self.cursor is None:
+            self._handle_end_of_level()
+        else:
+            self._update_header()
+        self.set_status("Undid the last redo -- restored the previous data.", "success")
+
     def _redo_last(self) -> None:
         if not self.last_capture_id:
             self.set_status("Nothing to redo yet.", "warning")
             return
+        target = next((c for c in self.captures_cache if c["capture_id"] == self.last_capture_id), None)
+        if target is None:
+            self.set_status("Nothing to redo yet.", "warning")
+            return
+        self._record_undo_snapshot(target["level_index"], target["quantity"], [self.last_capture_id])
         cm.mark_superseded(self.captures_csv, self.last_capture_id)
         self.captures_cache = cm.read_captures(self.captures_csv)
         self._rebuild_run_grid()
@@ -1303,7 +1383,7 @@ class LightboxCalibrationApp(QMainWindow):
             current_level_index=self.current_level_index,
         )
         self._update_header()
-        self.set_status("Last capture marked for redo.", "info")
+        self.set_status("Last capture marked for redo. Use Undo Last Redo to restore it.", "info")
 
     def _skip_node(self) -> None:
         if self.cursor is None or self.cursor["next_kind"] != "grid":
@@ -1376,6 +1456,7 @@ class LightboxCalibrationApp(QMainWindow):
         )
         if target is None:
             return
+        self._record_undo_snapshot(level_index, quantity, [target["capture_id"]])
         cm.mark_superseded(self.captures_csv, target["capture_id"])
         self.captures_cache = cm.read_captures(self.captures_csv)
         self.cursor = {

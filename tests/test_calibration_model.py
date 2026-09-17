@@ -179,6 +179,15 @@ def test_captures_csv_round_trip_and_supersede(tmp_path):
     assert active[0]["col_index"] == 3
     assert active[0]["row_index"] == 3
 
+    # Undo: restoring the original row (and re-superseding the redo) recovers
+    # the exact original data -- nothing was ever actually deleted.
+    cm.mark_superseded(csv_path, record1["capture_id"], superseded=False)
+    cm.mark_superseded(csv_path, record2["capture_id"], superseded=True)
+    restored = cm.active_captures(cm.read_captures(csv_path))
+    assert len(restored) == 1
+    assert restored[0]["capture_id"] == record1["capture_id"]
+    assert restored[0]["mean"] == pytest.approx(sum([100.0, 101.0, 99.5]) / 3, rel=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # 8. Resume
