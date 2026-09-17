@@ -268,6 +268,7 @@ class LightboxCalibrationApp(QMainWindow):
         self.capture_start_ts = 0.0
         self.last_capture_id: str | None = None
         self._undo_snapshot: dict | None = None
+        self._last_active_quantity: str = "lux"
 
         # Sensor state -- same classes used by low_light_app, whether fed by
         # real hardware threads or (in --simulate) a QTimer-driven synthetic
@@ -883,10 +884,18 @@ class LightboxCalibrationApp(QMainWindow):
                 self.set_status("Sensors connected.", "success")
 
         # Run tab's live capture readout mirrors whichever quantity is active.
+        # Tracked in self._last_active_quantity (not read straight off
+        # self.cursor) because the cursor is None for as long as an
+        # end-of-pass/end-of-level dialog is open -- gating on it directly
+        # froze this readout for the whole time that modal was up, which is
+        # exactly when the operator most wants to keep watching the sensor
+        # settle. Qt's own timers keep firing under a modal dialog, so this
+        # was purely the gate, not the underlying poll/timer being stalled.
         if self.cursor is not None:
-            active_val = lux_value if self.cursor["pass"] == "lux" else irr_value
-            unit = "lx" if self.cursor["pass"] == "lux" else "W/m²"
-            self.live_readout_lbl.setText(f"{active_val:.2f} {unit}" if active_val is not None else "-- ")
+            self._last_active_quantity = self.cursor["pass"]
+        active_val = lux_value if self._last_active_quantity == "lux" else irr_value
+        unit = "lx" if self._last_active_quantity == "lux" else "W/m²"
+        self.live_readout_lbl.setText(f"{active_val:.2f} {unit}" if active_val is not None else "-- ")
 
     def _redraw_timeseries(self) -> None:
         now = time.time()
