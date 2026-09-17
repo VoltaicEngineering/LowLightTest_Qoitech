@@ -128,7 +128,8 @@ class GridWidget(QWidget):
         self.sensor_node: str | None = None
         self.reference_node: str | None = None
         self.current_node: str | None = None
-        self.on_node_clicked = None  # callable(node_label)
+        self.on_node_clicked = None  # callable(node_label), left click
+        self.on_node_right_clicked = None  # callable(node_label), right click
         self.setMouseTracking(True)
         self.setMinimumSize(320, 220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -165,8 +166,14 @@ class GridWidget(QWidget):
         if not self.clickable:
             return
         label = self._node_at(event.position())
-        if label and self.on_node_clicked:
-            self.on_node_clicked(label)
+        if not label:
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            if self.on_node_right_clicked:
+                self.on_node_right_clicked(label)
+        elif event.button() == Qt.MouseButton.LeftButton:
+            if self.on_node_clicked:
+                self.on_node_clicked(label)
 
     def mouseMoveEvent(self, event) -> None:
         label = self._node_at(event.position())
@@ -948,9 +955,16 @@ class LightboxCalibrationApp(QMainWindow):
         split = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(split, 1)
 
+        grid_col = QVBoxLayout()
+        grid_hint = QLabel("Right-click a captured node to redo it -- capture continues from where you left off.")
+        grid_hint.setStyleSheet("color:#555; font-size:9pt;")
+        grid_col.addWidget(grid_hint)
         self.run_grid = GridWidget(self.grid, clickable=True)
-        self.run_grid.on_node_clicked = self._on_run_grid_clicked
-        split.addWidget(self.run_grid)
+        self.run_grid.on_node_right_clicked = self._on_redo_node_clicked
+        grid_col.addWidget(self.run_grid, 1)
+        grid_wrap = QWidget()
+        grid_wrap.setLayout(grid_col)
+        split.addWidget(grid_wrap)
 
         panel = QWidget()
         play = QVBoxLayout(panel)
@@ -1340,7 +1354,14 @@ class LightboxCalibrationApp(QMainWindow):
         self._update_header()
         self.set_status("Remaining nodes skipped -- capture the reference-end node to close the pass.", "warning")
 
-    def _on_run_grid_clicked(self, label: str) -> None:
+    def _on_redo_node_clicked(self, label: str) -> None:
+        """Right-click a captured node in the Run tab grid to redo it. The
+        old capture is superseded (never deleted, per plan section 5) and the
+        cursor jumps to that node for a fresh capture. next_cursor() always
+        picks the earliest gap in serpentine order, so once the redo is
+        captured, advancing the cursor naturally snaps back to whichever node
+        was current before the interruption -- no separate "resume" bookkeeping
+        needed here."""
         if self.cursor is None or self.capture_in_progress or self.warmup_active:
             return
         state = self.run_grid.cell_state.get(label)
@@ -1363,7 +1384,7 @@ class LightboxCalibrationApp(QMainWindow):
         }
         self._rebuild_run_grid()
         self._update_header()
-        self.set_status(f"Jumped to {label} for a re-capture.", "info")
+        self.set_status(f"Redoing {label} -- capture will continue from where you left off afterward.", "info")
 
     # ------------------------------------------------------------------
     # Analysis tab
