@@ -694,6 +694,12 @@ class LightboxCalibrationApp(QMainWindow):
         self.run_grid.sensor_node = config["sensor_node"]
         self.run_grid.covered_nodes = set(cm.effective_covered_nodes(config, self.grid))
         self._rebuild_run_grid()
+        # Reset the cursor here rather than leaving a stale one from whatever
+        # campaign was previously loaded in this app instance; callers that
+        # are resuming set the real cursor right after this and call
+        # _update_header() again themselves.
+        self.cursor = None
+        self._update_header()
 
     # ------------------------------------------------------------------
     # Sensors tab
@@ -964,6 +970,24 @@ class LightboxCalibrationApp(QMainWindow):
         self.warmup_row.hide()
         layout.addWidget(self.warmup_row)
 
+        # Persistent fallback for whenever there's no active cursor and a
+        # campaign is loaded -- covers both "no level started yet" and
+        # "just cancelled/dismissed a variac or level-complete prompt" (that
+        # dialog is otherwise the only way in, and cancelling or closing it
+        # with the X used to leave no way back in at all).
+        self.no_pass_row = QWidget()
+        nplay = QHBoxLayout(self.no_pass_row)
+        nplay.setContentsMargins(0, 0, 0, 0)
+        start_level_btn = QPushButton("Start Next Level (enter VAC)")
+        start_level_btn.setProperty("primary", True)
+        start_level_btn.clicked.connect(self._guard(self._prompt_new_level))
+        finish_campaign_btn = QPushButton("Finish Campaign")
+        finish_campaign_btn.clicked.connect(self._guard(self._finish_campaign))
+        nplay.addWidget(start_level_btn)
+        nplay.addWidget(finish_campaign_btn)
+        self.no_pass_row.hide()
+        layout.addWidget(self.no_pass_row)
+
         split = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(split, 1)
 
@@ -1084,7 +1108,14 @@ class LightboxCalibrationApp(QMainWindow):
         if self.config is None or self.cursor is None:
             self.header_lbl.setText("No active pass")
             self.capture_btn.setEnabled(False)
+            # Whenever there's no cursor and a campaign is loaded, keep a
+            # persistent way back in -- otherwise cancelling the variac
+            # prompt, or dismissing "Level complete" with the dialog's own
+            # close button instead of a choice, strands the operator with
+            # no active pass and no button to recover with.
+            self.no_pass_row.setVisible(self.config is not None)
             return
+        self.no_pass_row.hide()
         node_count = self.grid.node_count
         idx = self.cursor["sequence_index"]
         progress = "ref" if idx < 0 else f"{idx + 1} / {node_count}"
@@ -1106,7 +1137,8 @@ class LightboxCalibrationApp(QMainWindow):
             self, "Variac level", f"Enter VAC for level {level_index}:", 0.0, 0.0, 130.0, 1,
         )
         if not ok:
-            self.set_status("Level entry cancelled.", "warning")
+            self.set_status("Level entry cancelled -- click Start Next Level when you're ready.", "warning")
+            self._update_header()
             return
 
         self.current_level_index = level_index
@@ -1315,6 +1347,12 @@ class LightboxCalibrationApp(QMainWindow):
             self._prompt_new_level()
         elif box.clickedButton() is finish_btn:
             self._finish_campaign()
+        else:
+            # Dialog closed without a choice (e.g. the window's own X) --
+            # _handle_end_of_level() already made the Start Next Level /
+            # Finish Campaign row visible before this dialog opened, so
+            # there's still a way back in.
+            self.set_status("Level complete -- Start Next Level or Finish Campaign when ready.", "info")
 
     def _finish_campaign(self) -> None:
         self.captures_cache = cm.read_captures(self.captures_csv)
