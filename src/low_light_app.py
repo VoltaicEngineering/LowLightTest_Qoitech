@@ -110,7 +110,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SUMMARY_CSV = PROJECT_ROOT / "report" / "LowLightTesting_summary.csv"
 
 # Stable, deterministic color assignment (by sorted group label) for the
-# Analysis tab's 4 graphs, so a given panel type keeps the same color
+# Analysis tab's 4 graphs, so a given panel keeps the same color
 # across redraws and across all 4 subplots.
 _ANALYSIS_PALETTE = [
     "#1a56db", "#c53030", "#1b8a5a", "#8a5300", "#6b46c1",
@@ -865,18 +865,18 @@ class LowLightApp(QMainWindow):
         top_row.addWidget(reload_btn)
         layout.addLayout(top_row)
 
-        # Filters: narrow which panel types/serials are plotted. Applied at
+        # Filters: narrow which panels are plotted. Applied at
         # display time only (see _refresh_analysis_tab) -- they never change
-        # which measurements feed into a group's 1000 W/m^2 reference, only
+        # which measurements feed into a panel's 1000 W/m^2 reference, only
         # what's drawn, so hiding a panel can't quietly shift another one's
         # normalization.
         filter_row = QHBoxLayout()
-        self._filter_serial_list = self._make_filter_list()
+        self._filter_panel_list = self._make_filter_list()
         self._filter_celltype_list = self._make_filter_list()
         self._filter_series_list = self._make_filter_list()
         self._filter_parallel_list = self._make_filter_list()
         for label, widget in (
-            ("Serial", self._filter_serial_list),
+            ("Panel Name", self._filter_panel_list),
             ("Cell Type", self._filter_celltype_list),
             ("Series", self._filter_series_list),
             ("Parallel", self._filter_parallel_list),
@@ -928,10 +928,10 @@ class LowLightApp(QMainWindow):
         layout.setSpacing(6)
 
         intro = QLabel(
-            "One row per panel serial prefix (e.g. \"P124\" out of \"P124N042\"). "
-            "Panels sharing the same Cell Type + Cells Series + Cells Parallel pool into "
-            "one 1000 W/m² reference baseline on the Analysis tab. Edits here save to the "
-            "panel config file and refresh the Analysis tab automatically."
+            "One row per panel, keyed by the exact Panel Name entered on the Measure tab "
+            "(case-insensitive). Each panel is normalized against its own 1000 W/m² "
+            "measurements on the Analysis tab. Edits here save to the panel config file "
+            "and refresh the Analysis tab automatically."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color:#555; font-size:9pt;")
@@ -945,7 +945,7 @@ class LowLightApp(QMainWindow):
         self.panel_config_table = QTableWidget()
         self.panel_config_table.setColumnCount(4)
         self.panel_config_table.setHorizontalHeaderLabels(
-            ["Serial Prefix", "Cell Type", "Cells Series", "Cells Parallel"]
+            ["Panel Name", "Cell Type", "Cells Series", "Cells Parallel"]
         )
         hdr = self.panel_config_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
@@ -959,6 +959,12 @@ class LowLightApp(QMainWindow):
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add Row")
         add_btn.clicked.connect(self._guard(self._add_panel_config_row))
+        add_measured_btn = QPushButton("Add Measured Panels")
+        add_measured_btn.setToolTip(
+            "Add a row for every Panel Name in the current working folder's results "
+            "that has no config yet -- fill in Cells Series/Parallel to include it"
+        )
+        add_measured_btn.clicked.connect(self._guard(self._add_measured_panel_rows))
         delete_btn = QPushButton("Delete Selected Row(s)")
         delete_btn.setProperty("danger", True)
         delete_btn.clicked.connect(self._guard(self._delete_panel_config_rows))
@@ -966,6 +972,7 @@ class LowLightApp(QMainWindow):
         reload_btn.setToolTip("Discard unsaved table edits and re-read the file from disk")
         reload_btn.clicked.connect(self._guard(self._reload_panel_config))
         btn_row.addWidget(add_btn)
+        btn_row.addWidget(add_measured_btn)
         btn_row.addWidget(delete_btn)
         btn_row.addWidget(reload_btn)
         btn_row.addStretch()
@@ -1028,10 +1035,10 @@ class LowLightApp(QMainWindow):
     def _populate_panel_config_table(self) -> None:
         self.panel_config_table.blockSignals(True)
         self.panel_config_table.setRowCount(0)
-        for prefix, entry in sorted(self.panel_config.items()):
+        for name, entry in sorted(self.panel_config.items(), key=lambda kv: norm_analysis.normalize_panel_name(kv[0])):
             r = self.panel_config_table.rowCount()
             self.panel_config_table.insertRow(r)
-            self.panel_config_table.setItem(r, 0, QTableWidgetItem(prefix))
+            self.panel_config_table.setItem(r, 0, QTableWidgetItem(name))
             self.panel_config_table.setItem(r, 1, QTableWidgetItem(entry["cell_type"]))
             self.panel_config_table.setItem(r, 2, QTableWidgetItem(str(entry["cells_series"])))
             self.panel_config_table.setItem(r, 3, QTableWidgetItem(str(entry["cells_parallel"])))
@@ -1045,9 +1052,50 @@ class LowLightApp(QMainWindow):
             self.panel_config_table.setItem(r, c, QTableWidgetItem(default))
         self.panel_config_table.blockSignals(False)
         self.panel_config_table.editItem(self.panel_config_table.item(r, 0))
-        # Left blank (no serial prefix) until the operator actually edits a
-        # cell -- _on_panel_config_table_changed() skips prefix-less rows
+        # Left blank (no panel name) until the operator actually edits a
+        # cell -- _on_panel_config_table_changed() skips name-less rows
         # rather than saving/plotting an incomplete one.
+
+    def _read_summary_rows(self) -> list:
+        summary_path = self.working_dir / SESSION_CSV_NAME
+        if not summary_path.exists():
+            return []
+        with summary_path.open("r", newline="", encoding="utf-8") as fh:
+            return list(csv.DictReader(fh))
+
+    def _add_measured_panel_rows(self) -> None:
+        """Append a row for each Panel Name in the working folder's results
+        that isn't in the table yet. Series/Parallel are left blank, so the
+        row isn't saved until the operator fills them in."""
+        try:
+            rows = self._read_summary_rows()
+        except Exception as e:
+            self.panel_config_status_lbl.setText(f"Could not read measured panels: {e}")
+            return
+        present = set()
+        for r in range(self.panel_config_table.rowCount()):
+            item = self.panel_config_table.item(r, 0)
+            if item and item.text().strip():
+                present.add(norm_analysis.normalize_panel_name(item.text()))
+        missing = {}
+        for row in rows:
+            name = (row.get("panel_name") or "").strip()
+            key = norm_analysis.normalize_panel_name(name)
+            if key and key not in present and key not in missing:
+                missing[key] = name
+        if not missing:
+            self.panel_config_status_lbl.setText("Every measured panel already has a row.")
+            return
+        self.panel_config_table.blockSignals(True)
+        for key in sorted(missing):
+            r = self.panel_config_table.rowCount()
+            self.panel_config_table.insertRow(r)
+            for c, value in enumerate((missing[key], "", "", "")):
+                self.panel_config_table.setItem(r, c, QTableWidgetItem(value))
+        self.panel_config_table.blockSignals(False)
+        self.panel_config_status_lbl.setText(
+            f"Added {len(missing)} measured panel(s). Fill in Cells Series/Parallel to save and analyse them."
+        )
 
     def _delete_panel_config_rows(self) -> None:
         rows = sorted({item.row() for item in self.panel_config_table.selectedItems()}, reverse=True)
@@ -1066,22 +1114,33 @@ class LowLightApp(QMainWindow):
         so "every time a change is made" the graphs stay in sync."""
         config = {}
         invalid_rows = 0
+        incomplete_rows = 0
+        duplicate_rows = 0
+        seen = set()
 
         def _text(r, c):
             item = self.panel_config_table.item(r, c)
             return item.text().strip() if item else ""
 
         for r in range(self.panel_config_table.rowCount()):
-            prefix = _text(r, 0).upper()
-            if not prefix:
+            name = _text(r, 0)
+            if not name:
                 continue  # incomplete/new row -- not an error, just not ready yet
+            if not _text(r, 2) or not _text(r, 3):
+                incomplete_rows += 1  # e.g. from "Add Measured Panels", not filled in yet
+                continue
+            key = norm_analysis.normalize_panel_name(name)
+            if key in seen:
+                duplicate_rows += 1
+                continue
             try:
                 cells_series = int(float(_text(r, 2)))
                 cells_parallel = int(float(_text(r, 3)))
             except ValueError:
                 invalid_rows += 1
                 continue
-            config[prefix] = {
+            seen.add(key)
+            config[name] = {
                 "cell_type": _text(r, 1),
                 "cells_series": cells_series,
                 "cells_parallel": cells_parallel,
@@ -1096,6 +1155,10 @@ class LowLightApp(QMainWindow):
             status = f"Could not save panel config to {path}: {e}"
         if invalid_rows:
             status += f" {invalid_rows} row(s) skipped (Cells Series/Parallel must be numbers)."
+        if incomplete_rows:
+            status += f" {incomplete_rows} row(s) not saved yet (Cells Series/Parallel blank)."
+        if duplicate_rows:
+            status += f" {duplicate_rows} duplicate Panel Name row(s) ignored (first one kept)."
         self.panel_config_status_lbl.setText(status)
         self.panel_config_lbl.setText(f"Panel config: {path} ({len(self.panel_config)} entries)")
 
@@ -1106,13 +1169,13 @@ class LowLightApp(QMainWindow):
         """(Re)populate the 4 filter lists from the currently-loaded panel
         config, preserving each list's current selection where the value
         still exists."""
-        serials = sorted(self.panel_config.keys())
+        panel_names = sorted(self.panel_config.keys(), key=norm_analysis.normalize_panel_name)
         cell_types = sorted({e["cell_type"] for e in self.panel_config.values() if e["cell_type"]})
         series_vals = sorted({str(e["cells_series"]) for e in self.panel_config.values()}, key=lambda s: float(s))
         parallel_vals = sorted({str(e["cells_parallel"]) for e in self.panel_config.values()}, key=lambda s: float(s))
 
         for widget, values in (
-            (self._filter_serial_list, serials),
+            (self._filter_panel_list, panel_names),
             (self._filter_celltype_list, cell_types),
             (self._filter_series_list, series_vals),
             (self._filter_parallel_list, parallel_vals),
@@ -1129,7 +1192,7 @@ class LowLightApp(QMainWindow):
 
     def _clear_analysis_filters(self) -> None:
         for widget in (
-            self._filter_serial_list, self._filter_celltype_list,
+            self._filter_panel_list, self._filter_celltype_list,
             self._filter_series_list, self._filter_parallel_list,
         ):
             widget.clearSelection()
@@ -1189,27 +1252,28 @@ class LowLightApp(QMainWindow):
         staleness. Filters only affect what's drawn here, never what feeds
         into a group's reference -- see compute_norm_dataset, which runs on
         the unfiltered dataset."""
-        summary_path = self.working_dir / SESSION_CSV_NAME
-        rows: list = []
-        if summary_path.exists():
-            try:
-                with summary_path.open("r", newline="", encoding="utf-8") as fh:
-                    rows = list(csv.DictReader(fh))
-            except Exception as e:
-                self.analysis_status_lbl.setText(f"Could not read {summary_path}: {e}")
-                return
+        try:
+            rows = self._read_summary_rows()
+        except Exception as e:
+            self.analysis_status_lbl.setText(f"Could not read {self.working_dir / SESSION_CSV_NAME}: {e}")
+            return
 
         tolerance = self.settings.get("reference_tolerance_pct", 3.0) / 100.0
         result = norm_analysis.compute_norm_dataset(rows, self.panel_config, tolerance=tolerance)
         groups = result["groups"]
 
-        selected_serials = {item.text() for item in self._filter_serial_list.selectedItems()}
+        selected_panels = {
+            norm_analysis.normalize_panel_name(item.text()) for item in self._filter_panel_list.selectedItems()
+        }
         selected_cell_types = {item.text() for item in self._filter_celltype_list.selectedItems()}
         selected_series = {item.text() for item in self._filter_series_list.selectedItems()}
         selected_parallel = {item.text() for item in self._filter_parallel_list.selectedItems()}
 
-        def group_visible(group_key) -> bool:
-            cell_type, series, parallel = group_key
+        def group_visible(group_key, group_data) -> bool:
+            cell_type = group_data["cell_type"]
+            series, parallel = group_data["cells_series"], group_data["cells_parallel"]
+            if selected_panels and group_key not in selected_panels:
+                return False
             if selected_cell_types and cell_type not in selected_cell_types:
                 return False
             if selected_series and str(series) not in selected_series:
@@ -1227,14 +1291,9 @@ class LowLightApp(QMainWindow):
         plotted_points = 0
         plotted_groups = 0
         for idx, (group_key, group_data) in enumerate(sorted_groups):
-            if not group_visible(group_key):
+            if not group_visible(group_key, group_data):
                 continue
             points = group_data["points"]
-            if selected_serials:
-                points = [
-                    p for p in points
-                    if norm_analysis.extract_serial_prefix(p["panel_name"]) in selected_serials
-                ]
             if not points:
                 continue
 
@@ -1255,10 +1314,10 @@ class LowLightApp(QMainWindow):
         self.analysis_canvas.figure.tight_layout()
         self.analysis_canvas.draw_idle()
 
-        filters_active = bool(selected_serials or selected_cell_types or selected_series or selected_parallel)
+        filters_active = bool(selected_panels or selected_cell_types or selected_series or selected_parallel)
         filter_note = " (filtered)" if filters_active else ""
         self.analysis_status_lbl.setText(
-            f"{plotted_groups} panel type(s), {plotted_points} point(s) plotted{filter_note} — "
+            f"{plotted_groups} panel(s), {plotted_points} point(s) plotted{filter_note} — "
             f"{result['skipped_no_config']} skipped (no panel config match), "
             f"{result['skipped_no_reference']} skipped (no 1000 W/m² reference yet), "
             f"{result['skipped_bad_data']} skipped (missing/bad data)"

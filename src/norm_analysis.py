@@ -12,52 +12,40 @@ deck wasn't directly viewable):
                             of 1000 W/m^2 -- 900 <= ... <= 1100 at the
                             default 10% tolerance, adjustable in Settings)
     Norm_X (%)   = X_measured / Ref_X[group] * 100
-for X in {Wp, Vp, Ip, Isc}. A "group" is (cell_type, cells_series,
-cells_parallel) from the panel config file, keyed by each panel name's
-*serial prefix* (e.g. "P124" out of "P124N042") rather than the full name,
-so the operator doesn't have to enumerate every individual unit.
+for X in {Wp, Vp, Ip, Isc}. A "group" is one panel, identified by the full
+Panel Name entered on the Measure tab (matched case-insensitively, ignoring
+surrounding whitespace). Every panel is normalized against its own 1000 W/m^2
+measurements, and its cell_type / cells_series / cells_parallel come from its
+own row in the panel config file -- two units sharing a serial prefix (e.g.
+"P124N042" and "P124N043") no longer pool into one baseline.
 """
 from __future__ import annotations
 
 import csv
-import re
 from pathlib import Path
 
 DEFAULT_TOLERANCE = 0.10  # +/-10% of 1000 W/m^2
 REFERENCE_IRRADIANCE = 1000.0
 
-_SERIAL_PREFIX_PATTERN = re.compile(r"^([A-Za-z]+\d*)")
-
 _ROW_FIELDS = ("Wp", "Vp", "Ip", "Isc")
 
 
-def extract_serial_prefix(panel_name: str) -> str:
-    """Extract the leading serial prefix (letters then optional digits,
-    e.g. "P124" out of "P124N042", "IXYS" out of "IXYS123") and uppercase
-    it for case-insensitive matching (e.g. "p124N042" -> "P124").
-
-    Permanent fallback, not just a historical-data accommodation: any name
-    that doesn't fit the pattern (old junk data, a typo, a one-off test
-    panel, anything unanticipated) must never crash or throw -- it just
-    becomes its own standalone prefix (the whole name, uppercased), which
-    naturally won't match any config entry and is silently excluded from
-    the analysis rather than being a special error case.
-    """
-    name = (panel_name or "").strip()
-    if not name:
-        return ""
-    match = _SERIAL_PREFIX_PATTERN.match(name)
-    if match:
-        return match.group(1).upper()
-    return name.upper()
+def normalize_panel_name(panel_name: str) -> str:
+    """Matching key for a panel name: surrounding whitespace stripped and
+    case-folded, so "p124n042 " and "P124N042" are the same panel. Any
+    string is accepted -- a name with no config entry is simply excluded
+    from the analysis, never an error."""
+    return (panel_name or "").strip().casefold()
 
 
 def load_panel_config(path) -> dict:
-    """Read a CSV of serial_prefix,cell_type,cells_series,cells_parallel
-    into {serial_prefix (uppercased): {"cell_type", "cells_series",
+    """Read a CSV of panel_name,cell_type,cells_series,cells_parallel into
+    {panel_name (as written): {"cell_type", "cells_series",
     "cells_parallel"}}. Tolerant of a missing/malformed file -- returns {}
     rather than raising, since the panel config is optional until the
-    operator has created one."""
+    operator has created one. A legacy file with a serial_prefix column is
+    still read (each prefix becomes a panel name), so nothing is lost; those
+    rows just won't match until they're renamed to full panel names."""
     config = {}
     csv_path = Path(path)
     if not csv_path.exists():
@@ -67,15 +55,15 @@ def load_panel_config(path) -> dict:
         with csv_path.open("r", newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             for row in reader:
-                prefix = (row.get("serial_prefix") or "").strip()
-                if not prefix or prefix.startswith("#"):
+                name = (row.get("panel_name") or row.get("serial_prefix") or "").strip()
+                if not name or name.startswith("#"):
                     continue
                 try:
                     cells_series = int(float(row.get("cells_series", "").strip()))
                     cells_parallel = int(float(row.get("cells_parallel", "").strip()))
-                except (TypeError, ValueError):
+                except (AttributeError, TypeError, ValueError):
                     continue
-                config[prefix.upper()] = {
+                config[name] = {
                     "cell_type": (row.get("cell_type") or "").strip(),
                     "cells_series": cells_series,
                     "cells_parallel": cells_parallel,
@@ -87,34 +75,29 @@ def load_panel_config(path) -> dict:
 
 
 def save_panel_config(path, config: dict) -> None:
-    """Write {serial_prefix: {"cell_type", "cells_series", "cells_parallel"}}
-    back out as a plain CSV (sorted by prefix for a stable diff), overwriting
+    """Write {panel_name: {"cell_type", "cells_series", "cells_parallel"}}
+    back out as a plain CSV (sorted by name for a stable diff), overwriting
     whatever was there -- used by the in-app Panel Config editor tab so every
     table edit stays persisted to disk."""
     csv_path = Path(path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["serial_prefix", "cell_type", "cells_series", "cells_parallel"])
-        for prefix in sorted(config.keys()):
-            entry = config[prefix]
-            writer.writerow([prefix, entry["cell_type"], entry["cells_series"], entry["cells_parallel"]])
+        writer.writerow(["panel_name", "cell_type", "cells_series", "cells_parallel"])
+        for name in sorted(config.keys(), key=normalize_panel_name):
+            entry = config[name]
+            writer.writerow([name, entry["cell_type"], entry["cells_series"], entry["cells_parallel"]])
 
 
-def group_key_for(panel_name: str, config: dict):
-    """Resolve a panel name to its (cell_type, cells_series, cells_parallel)
-    group key via its serial prefix, or None if that prefix has no config
-    entry (the measurement is excluded from analysis, not crashed on)."""
-    prefix = extract_serial_prefix(panel_name)
-    entry = config.get(prefix)
-    if entry is None:
-        return None
-    return (entry["cell_type"], entry["cells_series"], entry["cells_parallel"])
+def config_index(config: dict) -> dict:
+    """{normalized panel name: (configured name, entry)} for lookups."""
+    return {normalize_panel_name(name): (name, entry) for name, entry in config.items()}
 
 
-def group_label(group_key) -> str:
-    cell_type, series, parallel = group_key
-    return f"{cell_type} {series}S{parallel}P" if cell_type else f"{series}S{parallel}P"
+def group_label(name: str, entry: dict) -> str:
+    cell_type, series, parallel = entry["cell_type"], entry["cells_series"], entry["cells_parallel"]
+    layout = f"{cell_type} {series}S{parallel}P" if cell_type else f"{series}S{parallel}P"
+    return f"{name} ({layout})"
 
 
 def _parse_float(value):
@@ -136,12 +119,15 @@ def compute_norm_dataset(rows, config: dict, tolerance: float = DEFAULT_TOLERANC
 
     Returns:
         {
-            "groups": {group_key: {"label": str, "points": [
+            "groups": {normalized panel name: {
+                "label": str, "panel_name": str,  # configured spelling
+                "cell_type": str, "cells_series": int, "cells_parallel": int,
+                "points": [
                 {"irradiance": float, "panel_name": str,
                  "norm_wp": float, "norm_vp": float,
                  "norm_ip": float, "norm_isc": float}, ...
             ]}},
-            "skipped_no_config": int,   # panel name's prefix has no config entry
+            "skipped_no_config": int,   # panel name has no config entry
             "skipped_bad_data": int,    # missing/unparseable Wp/Vp/Ip/Isc/irradiance
             "skipped_no_reference": int,  # valid group, but no reference established yet
         }
@@ -153,10 +139,12 @@ def compute_norm_dataset(rows, config: dict, tolerance: float = DEFAULT_TOLERANC
     skipped_no_config = 0
     skipped_bad_data = 0
 
+    index = config_index(config)
+
     for row in rows:
         panel_name = row.get("panel_name", "")
-        group_key = group_key_for(panel_name, config)
-        if group_key is None:
+        group_key = normalize_panel_name(panel_name)
+        if group_key not in index:
             skipped_no_config += 1
             continue
 
@@ -199,7 +187,15 @@ def compute_norm_dataset(rows, config: dict, tolerance: float = DEFAULT_TOLERANC
             })
         points.sort(key=lambda p: p["irradiance"])
 
-        groups[group_key] = {"label": group_label(group_key), "points": points}
+        name, entry = index[group_key]
+        groups[group_key] = {
+            "label": group_label(name, entry),
+            "panel_name": name,
+            "cell_type": entry["cell_type"],
+            "cells_series": entry["cells_series"],
+            "cells_parallel": entry["cells_parallel"],
+            "points": points,
+        }
 
     return {
         "groups": groups,
