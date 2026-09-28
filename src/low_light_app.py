@@ -735,6 +735,14 @@ class LowLightApp(QMainWindow):
         panel_form.addRow("Solar Intensity:", self.si_edit)
         panel_form.addRow("Panel Temp (°C):", self.panel_temp_edit)
         panel_form.addRow("Notes:", self.notes_edit)
+        # Same setting as Settings > "IV sweep timeout (s)", surfaced here so
+        # it can be changed between runs without opening the dialog.
+        self.sweep_timeout_edit = QLineEdit(f"{self.settings['iv_timeout_seconds']:g}")
+        self.sweep_timeout_edit.setToolTip(
+            "Maximum time the IV sweep may run before it is aborted. Takes effect on the next Run Test."
+        )
+        self.sweep_timeout_edit.editingFinished.connect(self._guard(self._commit_sweep_timeout))
+        panel_form.addRow("Sweep Timeout (s):", self.sweep_timeout_edit)
         clay.addLayout(panel_form)
 
         self.btn_run = QPushButton("Run Test  (Ctrl+R)")
@@ -1434,8 +1442,28 @@ class LowLightApp(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.settings.update(dlg.values())
             save_settings(self.settings)
+            self.sweep_timeout_edit.setText(f"{self.settings['iv_timeout_seconds']:g}")
             # panel_config_path / reference_tolerance_pct may have changed.
             self._reload_panel_config()
+
+    def _commit_sweep_timeout(self) -> None:
+        """Validate the Measure tab's Sweep Timeout box and persist it as
+        iv_timeout_seconds. An invalid or non-positive entry reverts the box
+        to the current setting rather than being silently used."""
+        current = self.settings["iv_timeout_seconds"]
+        try:
+            value = float(self.sweep_timeout_edit.text().strip())
+        except ValueError:
+            value = None
+        if value is None or value <= 0:
+            self.sweep_timeout_edit.setText(f"{current:g}")
+            self.set_status(f"Sweep timeout must be a positive number -- kept {current:g}s.", "warning")
+            return
+        if value != current:
+            self.settings["iv_timeout_seconds"] = value
+            save_settings(self.settings)
+            self.set_status(f"Sweep timeout set to {value:g}s.", "info")
+        self.sweep_timeout_edit.setText(f"{value:g}")
 
     # ------------------------------------------------------------------
     # Working folder (where this session's IV curve files live)
@@ -1994,6 +2022,10 @@ class LowLightApp(QMainWindow):
         # measurement's own Otii calls (2026-09 adversarial review finding
         # #3/#6) -- belt-and-suspenders alongside self._otii_lock, which
         # covers it even if some future code path forgets this button.
+        # Commit the Sweep Timeout box first: Ctrl+R doesn't move focus, so
+        # an edit still sitting in the box wouldn't have fired
+        # editingFinished yet.
+        self._commit_sweep_timeout()
         self.btn_run.setEnabled(False)
         self.btn_connect.setEnabled(False)
         if not self._launch_task(self._async_start_measurement()):
