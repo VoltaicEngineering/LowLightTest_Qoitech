@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 
@@ -95,6 +96,7 @@ from IV_curve_CURRENT_V3 import (
     build_clipboard_row,
     connect_otii_session,
     copy_to_clipboard,
+    delete_recording,
     derive_panel_type,
     fetch_recording_channels,
     harvest,
@@ -229,6 +231,9 @@ DEFAULT_SETTINGS = {
     "otii_restart_wait_seconds": 5.0,
     "iv_timeout_seconds": 50.0,
     "otii_call_timeout_seconds": 12.0,
+    # Delete each recording from the Otii project once its data is saved.
+    # Otii slows down as a project fills with recordings.
+    "otii_delete_recordings": True,
     "summary_csv": str(DEFAULT_SUMMARY_CSV),
     "working_dir": "",  # "" = use the process's current working directory
     "panel_config_path": str(DEFAULT_PANEL_CONFIG_PATH),
@@ -248,6 +253,7 @@ _SETTINGS_META = {
     "otii_restart_wait_seconds": ("float", "Seconds to wait after restarting Otii before reconnecting.", 0.0, False),
     "iv_timeout_seconds": ("float", "Maximum IV sweep time before it is aborted (same as Sweep Timeout on the Measure tab).", 0.0, True),
     "otii_call_timeout_seconds": ("float", "Timeout for a single Otii call before the connection counts as lost.", 0.0, True),
+    "otii_delete_recordings": ("bool", "Delete each recording from the Otii project once its IV data is saved (keeps later sweeps fast). false keeps them in Otii."),
     "summary_csv": ("path", "Summary CSV. Always <working folder>/LowLightTesting_summary.csv; change the working folder instead.", None, None, True),
     "working_dir": ("path", "Working folder for IV files and the summary CSV (the session there is reloaded)."),
     "panel_config_path": ("path", "Panel config CSV (panel name, cells, width/height)."),
@@ -278,6 +284,13 @@ def parse_setting_value(key: str, text: str, default):
             if (strict and value <= minimum) or (not strict and value < minimum):
                 raise ValueError(f"must be {'>' if strict else '>='} {minimum:g}")
         return value
+    if kind == "bool":
+        low = text.lower()
+        if low in ("true", "yes", "1", "on"):
+            return True
+        if low in ("false", "no", "0", "off"):
+            return False
+        raise ValueError("must be true or false")
     if kind == "node":
         try:
             import calibration_model as _cm
@@ -2243,6 +2256,33 @@ class LowLightApp(QMainWindow):
             self.btn_run.setEnabled(True)
         self._on_main(_enable_ui)
 
+    async def _soft_reconnect_otii(self) -> bool:
+        """Replace the Otii TCP connection with a fresh one, without
+        restarting Otii. Returns False (and marks Otii disconnected) if the
+        new connection fails."""
+        async with self._otii_lock:
+            self._close_otii_connection()
+            try:
+                connection, otii_object, active_proj, devices = await call_with_timeout(
+                    connect_otii_session, timeout=self.settings["otii_call_timeout_seconds"]
+                )
+            except Exception as e:
+                _log("warn", "otii_soft_reconnect_failed", error=str(e))
+                self.otii_connection = None
+                self.otii_object = None
+                self.otii_project = None
+                self.otii_devices = []
+                self._set_otii_badge("● Otii: disconnected", "#ffcccc")
+                self._reset_connect_button()
+                return False
+            self.otii_connection = connection
+            self.otii_object = otii_object
+            self.otii_project = active_proj
+            self.otii_devices = devices
+        _log("info", "otii_soft_reconnect_ok", devices=len(devices))
+        self._set_otii_badge(f"● Otii: connected ({len(devices)} Arc)", "#a6ffcc")
+        return True
+
     def _show_otii_error(self, message: str, set_status_text: bool = True):
         self._set_otii_badge("● Otii: error", "#ffcccc")
         if set_status_text:
@@ -2287,7 +2327,11 @@ class LowLightApp(QMainWindow):
         except OtiiCommsTimeout:
             await self._handle_otii_comms_lost("Otii stopped responding (idle health check)")
             return
-        except Exception:
+        except Exception as e:
+            # Not a hang but an error (e.g. a transaction-id mismatch after
+            # an earlier timeout). Try a fresh connection.
+            _log("warn", "otii_ping_failed", error=str(e))
+            await self._soft_reconnect_otii()
             return
         finally:
             self._ping_in_flight = False
@@ -2493,6 +2537,8 @@ class LowLightApp(QMainWindow):
 
         call_timeout = self.settings["otii_call_timeout_seconds"]
         sweep_timeout = self.settings["iv_timeout_seconds"]
+        delete_after = bool(self.settings.get("otii_delete_recordings", True))
+        sweep_stats: dict = {}
 
         try:
             # Holds the same lock a connect/reconnect or an idle-watchdog
@@ -2503,7 +2549,8 @@ class LowLightApp(QMainWindow):
             # doesn't need the connection, so it's done outside the lock.
             async with self._otii_lock:
                 isc_measured = await call_with_timeout(
-                    short_circuit, self.otii_project, self.otii_devices, timeout=max(call_timeout, 15.0)
+                    short_circuit, self.otii_project, self.otii_devices,
+                    timeout=max(call_timeout, 15.0), delete_recording_after=delete_after,
                 )
                 if isc_measured <= 0:
                     raise RuntimeError(f"Invalid Isc measured: {isc_measured}")
@@ -2564,9 +2611,12 @@ class LowLightApp(QMainWindow):
                         _on_live_data,
                         timeout=sweep_timeout + max(call_timeout, 15.0),
                         stop_event=self._end_sweep_event,
+                        stats=sweep_stats,
                     )
                 finally:
                     self._on_main(lambda: self.btn_end_sweep.setEnabled(False))
+                    if sweep_stats:
+                        _log("info", "iv_sweep_timing", panel=panel_name, **sweep_stats)
 
                 my_arc = self.otii_devices[0]
 
@@ -2582,6 +2632,14 @@ class LowLightApp(QMainWindow):
                     fetch_recording_channels, recording, my_arc,
                     timeout=max(call_timeout, 15.0),
                 )
+                if delete_after:
+                    # The data is in hand (and saved to disk just below), so
+                    # drop the recording from Otii. A project that keeps
+                    # filling up is what made later sweeps slower.
+                    try:
+                        await call_with_timeout(delete_recording, recording, timeout=call_timeout)
+                    except Exception as e:
+                        _log("warn", "otii_delete_recording_failed", error=str(e))
 
             def _render_and_draw():
                 result = render_iv_curve(
@@ -2611,6 +2669,15 @@ class LowLightApp(QMainWindow):
             self._on_main(lambda: self._prog_row.hide())
             self._measuring = False
             self.set_status(f"Measurement failed: {msg}", "error")
+            _log("warn", "measurement_failed", error=msg, error_type=type(e).__name__)
+            # A failed or timed-out Otii call can leave a late reply sitting
+            # on the socket (or an abandoned thread still reading it), which
+            # then answers the next request with the wrong transaction id.
+            # A fresh TCP connection clears that without restarting Otii.
+            if not await self._soft_reconnect_otii():
+                self.set_status(
+                    f"Measurement failed: {msg}\nOtii then failed to reconnect. Click Connect to Otii.", "error"
+                )
             self._on_main(_reenable_run_and_connect)
             return
 
@@ -2658,7 +2725,8 @@ class LowLightApp(QMainWindow):
             self.btn_run.setEnabled(True)
             self.btn_save.setEnabled(True)
         self._on_main(_finish_ui)
-        self.set_status("Measurement complete — review the plot, then Save This Test", "success")
+        sweep_note = f" (sweep {sweep_stats['duration_s']:.0f} s)" if sweep_stats.get("duration_s") else ""
+        self.set_status(f"Measurement complete{sweep_note} — review the plot, then Save This Test", "success")
 
     # ------------------------------------------------------------------
     # Lightbox mode (--lightbox): calibrated indoor lightbox, one setpoint
@@ -3378,11 +3446,48 @@ class _SafeApplication(QApplication):
             return False
 
 
+def install_exception_hooks(get_window) -> None:
+    """PyQt6 aborts the whole process when an exception escapes any Python
+    slot, but only while sys.excepthook is Python's default one. With a
+    hook of our own installed, PyQt calls it and carries on. That covers
+    every slot, including the ones not wrapped in _guard() (e.g. dialog
+    buttons and timers). threading.excepthook does the same for background
+    threads, which otherwise die with only a stderr trace."""
+    def _report(exc_type, exc, tb, where):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        _log("error", "unhandled_exception", where=where, error=f"{exc_type.__name__}: {exc}")
+        if sys.__stderr__ is not None:
+            sys.__stderr__.write(text)
+        window = get_window()
+        if window is not None:
+            try:
+                window.set_status(f"Internal error (caught): {exc_type.__name__}: {exc}", "error")
+            except Exception:
+                pass
+
+    def _excepthook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        _report(exc_type, exc, tb, "main")
+
+    def _thread_excepthook(args):
+        if args.exc_type is SystemExit:
+            return
+        _report(args.exc_type, args.exc_value, args.exc_traceback, getattr(args.thread, "name", "thread"))
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+
+
 def main():
     lightbox = "--lightbox" in sys.argv[1:]
     argv = [a for a in sys.argv if a != "--lightbox"]
     app = _SafeApplication(argv)
+    holder = {"window": None}
+    install_exception_hooks(lambda: holder["window"])
     window = LowLightApp(lightbox=lightbox)
+    holder["window"] = window
     window.showMaximized()
 
     def _handle_exception(loop, context):

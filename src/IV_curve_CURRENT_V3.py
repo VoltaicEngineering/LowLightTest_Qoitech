@@ -96,6 +96,20 @@ def parse_args():
     return parser.parse_args()
 
 
+def wind_down_arc(my_arc):
+    """Stop sinking current and switch the Arc's main output off. Each call is
+    tried on its own, so one failure doesn't leave the others undone."""
+    for step in (
+        lambda: my_arc.set_main(False),
+        lambda: my_arc.set_main_current(0),
+        lambda: my_arc.set_power_regulation("voltage"),
+    ):
+        try:
+            step()
+        except Exception:
+            pass
+
+
 def cleanup(my_arcs):
     try:
         if proj is not None:
@@ -103,9 +117,38 @@ def cleanup(my_arcs):
     except Exception:
         pass
     for my_arc in my_arcs:
-        my_arc.set_main_current(0)
-        my_arc.set_main(False)
-        my_arc.set_power_regulation("voltage")
+        wind_down_arc(my_arc)
+
+
+# Exit-time safety net: registered once. short_circuit()/harvest() used to
+# call atexit.register() on every run, so after N runs closing the app ran
+# cleanup 2N times, each several Otii calls that wait up to 3 s apiece when
+# Otii is already gone. It now only runs if a sweep left an Arc switched on.
+_atexit_arcs = None
+_arcs_active = False
+
+
+def _atexit_cleanup():
+    if _arcs_active and _atexit_arcs:
+        cleanup(_atexit_arcs)
+
+
+atexit.register(_atexit_cleanup)
+
+
+def _mark_arcs_active(my_arcs, active):
+    global _atexit_arcs, _arcs_active
+    _atexit_arcs = my_arcs
+    _arcs_active = active
+
+
+def delete_recording(recording):
+    """Remove a finished recording from the Otii project. Every sweep (and
+    every Isc reading) adds one, and Otii gets slower as a project fills up.
+    That is why later IV curves took longer and a new project fixed it.
+    Only call this once the data has been fetched and saved."""
+    if recording is not None and getattr(recording, "id", -1) != -1:
+        recording.delete()
 
 
 def iv_get_inputs():
@@ -255,24 +298,47 @@ def _call_with_thread_timeout(fn, timeout_s, *args, **kwargs):
         executor.shutdown(wait=False)
 
 
-def short_circuit(active_proj, my_arcs):
+def short_circuit(active_proj, my_arcs, delete_recording_after=False):
     global Isc
-    atexit.register(cleanup, my_arcs)
-    for my_arc in my_arcs:
-        my_arc.set_main_current(0)
-        my_arc.set_power_regulation("inline")
-        my_arc.enable_channel("mv", True)
-        my_arc.enable_channel("mc", True)
-        my_arc.set_main(True)
-    time.sleep(0.1)
+    _mark_arcs_active(my_arcs, True)
+    ok = False
+    try:
+        for my_arc in my_arcs:
+            my_arc.set_main_current(0)
+            my_arc.set_power_regulation("inline")
+            my_arc.enable_channel("mv", True)
+            my_arc.enable_channel("mc", True)
+            my_arc.set_main(True)
+        time.sleep(0.1)
 
-    _call_with_thread_timeout(active_proj.start_recording, 10.0)
-    time.sleep(0.5)
-    recording = active_proj.get_last_recording()
-    Isc = -1 * my_arcs[0].get_value("mc")
-    _call_with_thread_timeout(active_proj.stop_recording, 10.0)
-    time.sleep(0.2)
-    return float(Isc)
+        _call_with_thread_timeout(active_proj.start_recording, 10.0)
+        try:
+            time.sleep(0.5)
+            recording = active_proj.get_last_recording()
+            Isc = -1 * my_arcs[0].get_value("mc")
+        except BaseException:
+            # Never leave a recording running: the next start_recording()
+            # would find one already going.
+            try:
+                _call_with_thread_timeout(active_proj.stop_recording, 10.0)
+            except Exception:
+                pass
+            raise
+        _call_with_thread_timeout(active_proj.stop_recording, 10.0)
+        time.sleep(0.2)
+        if delete_recording_after:
+            try:
+                delete_recording(recording)
+            except Exception:
+                pass
+        ok = True
+        return float(Isc)
+    finally:
+        if not ok:
+            # Failed part-way: don't leave the panel short-circuited.
+            for my_arc in my_arcs:
+                wind_down_arc(my_arc)
+            _mark_arcs_active(my_arcs, False)
 
 
 def harvest(
@@ -285,7 +351,11 @@ def harvest(
     live_data_interval_s=1.0,
     expected_max_current_uA=None,
     stop_event=None,
+    stats=None,
 ):
+    """stats: optional dict, filled with timing figures (steps, duration_s,
+    mean/max step latency, final interval, time spent on the live preview)
+    so a slowing sweep can be diagnosed from the log."""
     if expected_max_current_uA is None or expected_max_current_uA <= 0:
         # Callers derive current_step from Isc as current_step = Isc/150
         # (see run_single_measurement()/_async_start_measurement()), so a
@@ -297,7 +367,7 @@ def harvest(
         # 100% at the very end (2026-09 feedback: "progress bar not
         # working").
         expected_max_current_uA = current_step * 150.0
-    atexit.register(cleanup, my_arcs)
+    _mark_arcs_active(my_arcs, True)
     for my_arc in my_arcs:
         my_arc.set_main_current(0)
         my_arc.set_power_regulation("current")
@@ -312,16 +382,25 @@ def harvest(
 
     recording_started = False
     recording = None
+    ready = []
+    # Live preview data, fetched incrementally: each refresh asks Otii only
+    # for the samples added since the last one. It used to re-fetch the whole
+    # recording from sample 0 every second (1 kHz x 2 channels), so the
+    # transfer grew with the square of the sweep length, on the sweep's own
+    # thread, delaying every later step.
+    live_mv, live_mc = [], []
+    steps = 0
+    latency_sum = latency_max = live_time = 0.0
+    started = time.monotonic()
+    interval = SETTING["interval"]
     try:
         _call_with_thread_timeout(active_proj.start_recording, 10.0)
         recording_started = True
         time.sleep(0.5)
         recording = active_proj.get_last_recording()
 
-        ready = []
         started = time.monotonic()
         last_live_fetch = 0.0
-        interval = SETTING["interval"]
         for current_uA in range(0, int(SETTING["max_sink_current"]), int(current_step)):
             now = time.monotonic()
             if (now - started) > timeout_seconds:
@@ -335,9 +414,8 @@ def harvest(
                 # the final, valid data (explicit operator instruction).
                 for my_arc in my_arcs:
                     if my_arc.id not in ready:
-                        my_arc.set_main(False)
-                        my_arc.set_main_current(0)
-                        my_arc.set_power_regulation("voltage")
+                        wind_down_arc(my_arc)
+                        ready.append(my_arc.id)
                 break
 
             if progress_cb is not None:
@@ -345,18 +423,26 @@ def harvest(
 
             if live_data_cb is not None and (now - last_live_fetch) >= live_data_interval_s:
                 last_live_fetch = now
+                live_started = time.monotonic()
                 try:
                     # Best-effort only: runs on this same thread/connection,
                     # never a separate one, so it can't race the sweep's own
                     # requests -- but a live-preview hiccup must still never
                     # break the actual measurement.
-                    sample_count = recording.get_channel_data_count(my_arcs[0].id, "mv")
-                    if sample_count > 0:
-                        mv_live = recording.get_channel_data(my_arcs[0].id, "mv", 0, sample_count)["values"]
-                        mc_live = recording.get_channel_data(my_arcs[0].id, "mc", 0, sample_count)["values"]
-                        live_data_cb(mv_live, mc_live)
+                    arc_id = my_arcs[0].id
+                    count = min(
+                        recording.get_channel_data_count(arc_id, "mv"),
+                        recording.get_channel_data_count(arc_id, "mc"),
+                    )
+                    have = min(len(live_mv), len(live_mc))
+                    if count > have:
+                        live_mv.extend(recording.get_channel_data(arc_id, "mv", have, count - have)["values"])
+                        live_mc.extend(recording.get_channel_data(arc_id, "mc", have, count - have)["values"])
+                        n = min(len(live_mv), len(live_mc))
+                        live_data_cb(live_mv[:n], live_mc[:n])
                 except Exception:
                     pass
+                live_time += time.monotonic() - live_started
 
             step_started = time.monotonic()
             for my_arc in my_arcs:
@@ -367,6 +453,9 @@ def harvest(
                     my_arc.set_power_regulation("voltage")
                     ready.append(my_arc.id)
             call_latency = time.monotonic() - step_started
+            steps += 1
+            latency_sum += call_latency
+            latency_max = max(latency_max, call_latency)
 
             if len(ready) >= len(my_arcs):
                 break
@@ -382,12 +471,27 @@ def harvest(
 
             time.sleep(interval)
     finally:
+        # A timeout or an Otii error part-way through used to leave the Arc
+        # switched on and sinking current until the next run (or app exit).
+        for my_arc in my_arcs:
+            if my_arc.id not in ready:
+                wind_down_arc(my_arc)
+        _mark_arcs_active(my_arcs, False)
         if recording_started:
             try:
                 _call_with_thread_timeout(active_proj.stop_recording, 10.0)
             except Exception:
                 pass
         time.sleep(0.2)
+        if stats is not None:
+            stats.update(
+                steps=steps,
+                duration_s=round(time.monotonic() - started, 2),
+                mean_latency_ms=round(1000 * latency_sum / steps, 1) if steps else None,
+                max_latency_ms=round(1000 * latency_max, 1),
+                final_interval_ms=round(1000 * interval, 1),
+                live_preview_s=round(live_time, 2),
+            )
 
     # Only reached once cleanup above has actually finished -- previously
     # progress_cb(1.0) fired (and the GUI's progress bar showed 100%)
