@@ -477,19 +477,70 @@ SUMMARY_CSV_FIELDNAMES = [
     "irradiance_3sigma_pct",
     "png_path",
     "csv_path",
+    # Lightbox mode only (blank otherwise). irradiance_measured_live stays
+    # the raw sensor mean; irr_deviation_pct compares it minus
+    # irr_dark_offset against irr_expected.
+    "lightbox_setpoint_wm2",
+    "panel_width_mm",
+    "panel_height_mm",
+    "vac_target",
+    "vac_set",
+    "irr_dark_offset",
+    "irr_node",
+    "irr_expected",
+    "irr_deviation_pct",
+    "lux_node",
+    "lux_expected",
+    "lux_deviation_pct",
+    "calibration_campaign",
 ]
+
+
+def _existing_header(csv_file):
+    try:
+        with csv_file.open("r", newline="", encoding="utf-8") as fh:
+            return next(csv.reader(fh), None)
+    except OSError:
+        return None
+
+
+def upgrade_summary_csv_header(csv_path):
+    """If an existing summary CSV was written with an older field list,
+    rewrite it with the current SUMMARY_CSV_FIELDNAMES (missing columns
+    blank, unknown extra columns kept at the end) so appended rows never land
+    under the wrong header. Returns True if the file was rewritten."""
+    csv_file = Path(csv_path)
+    if not csv_file.exists():
+        return False
+    header = _existing_header(csv_file)
+    if not header or header == SUMMARY_CSV_FIELDNAMES:
+        return False
+    with csv_file.open("r", newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    extra = [h for h in header if h and h not in SUMMARY_CSV_FIELDNAMES]
+    fieldnames = SUMMARY_CSV_FIELDNAMES + extra
+    tmp = csv_file.with_suffix(csv_file.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k) or "" for k in fieldnames})
+    tmp.replace(csv_file)
+    return True
 
 
 def append_summary_csv(csv_path, row_values):
     csv_file = Path(csv_path)
     csv_file.parent.mkdir(parents=True, exist_ok=True)
 
+    upgrade_summary_csv_header(csv_file)
     file_exists = csv_file.exists()
+    fieldnames = (_existing_header(csv_file) if file_exists else None) or SUMMARY_CSV_FIELDNAMES
     with csv_file.open("a", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=SUMMARY_CSV_FIELDNAMES)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
         if not file_exists:
             writer.writeheader()
-        writer.writerow({k: row_values.get(k, "") for k in SUMMARY_CSV_FIELDNAMES})
+        writer.writerow({k: row_values.get(k, "") for k in fieldnames})
 
     return csv_file
 
@@ -829,6 +880,7 @@ def make_row(
     irradiance_3sigma_pct="",
     png_path="",
     csv_path="",
+    extra=None,
 ):
     row = {
         "session_id": session_id,
@@ -878,6 +930,9 @@ def make_row(
             row["png_path"] = metrics.get("png_path", "")
         if not row["csv_path"]:
             row["csv_path"] = metrics.get("csv_path", "")
+
+    if extra:
+        row.update({k: v for k, v in extra.items() if k in SUMMARY_CSV_FIELDNAMES})
 
     return row
 

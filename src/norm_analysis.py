@@ -38,10 +38,24 @@ def normalize_panel_name(panel_name: str) -> str:
     return (panel_name or "").strip().casefold()
 
 
+def parse_dimension_mm(text):
+    """Optional panel dimension: blank -> None, else a positive float.
+    Raises ValueError for anything else."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    value = float(text)
+    if not value > 0:
+        raise ValueError(f"dimension must be > 0 mm, got {text!r}")
+    return value
+
+
 def load_panel_config(path) -> dict:
-    """Read a CSV of panel_name,cell_type,cells_series,cells_parallel into
-    {panel_name (as written): {"cell_type", "cells_series",
-    "cells_parallel"}}. Tolerant of a missing/malformed file -- returns {}
+    """Read a CSV of panel_name,cell_type,cells_series,cells_parallel,
+    width_mm,height_mm into {panel_name (as written): {"cell_type",
+    "cells_series", "cells_parallel", "width_mm", "height_mm"}}. Width and
+    height are optional (None when blank or missing, e.g. an older file) and
+    only needed for lightbox runs. Tolerant of a missing/malformed file -- returns {}
     rather than raising, since the panel config is optional until the
     operator has created one. A legacy file with a serial_prefix column is
     still read (each prefix becomes a panel name), so nothing is lost; those
@@ -63,10 +77,17 @@ def load_panel_config(path) -> dict:
                     cells_parallel = int(float(row.get("cells_parallel", "").strip()))
                 except (AttributeError, TypeError, ValueError):
                     continue
+                try:
+                    width_mm = parse_dimension_mm(row.get("width_mm"))
+                    height_mm = parse_dimension_mm(row.get("height_mm"))
+                except ValueError:
+                    width_mm = height_mm = None
                 config[name] = {
                     "cell_type": (row.get("cell_type") or "").strip(),
                     "cells_series": cells_series,
                     "cells_parallel": cells_parallel,
+                    "width_mm": width_mm,
+                    "height_mm": height_mm,
                 }
     except Exception:
         return {}
@@ -75,7 +96,8 @@ def load_panel_config(path) -> dict:
 
 
 def save_panel_config(path, config: dict) -> None:
-    """Write {panel_name: {"cell_type", "cells_series", "cells_parallel"}}
+    """Write {panel_name: {"cell_type", "cells_series", "cells_parallel",
+    "width_mm", "height_mm"}}
     back out as a plain CSV (sorted by name for a stable diff), overwriting
     whatever was there -- used by the in-app Panel Config editor tab so every
     table edit stays persisted to disk."""
@@ -83,10 +105,17 @@ def save_panel_config(path, config: dict) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["panel_name", "cell_type", "cells_series", "cells_parallel"])
+        writer.writerow(["panel_name", "cell_type", "cells_series", "cells_parallel", "width_mm", "height_mm"])
         for name in sorted(config.keys(), key=normalize_panel_name):
             entry = config[name]
-            writer.writerow([name, entry["cell_type"], entry["cells_series"], entry["cells_parallel"]])
+            dims = ["" if entry.get(k) is None else f"{entry[k]:g}" for k in ("width_mm", "height_mm")]
+            writer.writerow([name, entry["cell_type"], entry["cells_series"], entry["cells_parallel"], *dims])
+
+
+def lookup_panel(panel_name: str, config: dict):
+    """(configured name, entry) for a panel name, matched case-insensitively,
+    or None."""
+    return config_index(config).get(normalize_panel_name(panel_name))
 
 
 def config_index(config: dict) -> dict:

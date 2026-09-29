@@ -28,7 +28,7 @@ import serial
 import serial.tools.list_ports
 
 from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -65,6 +65,7 @@ from matplotlib.figure import Figure
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import lightbox_mode as lbm
 import norm_analysis
 import sensors
 from triplett_lt68_probe_v3 import LT68
@@ -124,6 +125,20 @@ _COLUMNS = [
 ]
 _EDITABLE_COLS = {0, 7, 8, 9, 16}
 _FIELD_MAP = {0: "panel_name", 7: "light_meter", 8: "irradiance_gui_input", 9: "panel_temp_c", 16: "notes"}
+_NOTES_COL = 16
+# Lightbox mode only (hidden otherwise), appended after Notes so the indices
+# above never move: (header, row key, format spec or None for plain text).
+_LIGHTBOX_COLUMNS = [
+    ("Setpoint (W/m²)", "lightbox_setpoint_wm2", "g"),
+    ("VAC Set", "vac_set", ".1f"),
+    ("Irr Node", "irr_node", None),
+    ("Irr Exp (W/m²)", "irr_expected", ".4g"),
+    ("Irr Dev (%)", "irr_deviation_pct", "+.1f"),
+    ("Lux Node", "lux_node", None),
+    ("Lux Exp (lx)", "lux_expected", ".4g"),
+    ("Lux Dev (%)", "lux_deviation_pct", "+.1f"),
+]
+_COLUMNS = _COLUMNS + [c[0] for c in _LIGHTBOX_COLUMNS]
 
 
 def _log(level: str, event: str, **fields) -> None:
@@ -218,7 +233,65 @@ DEFAULT_SETTINGS = {
     "working_dir": "",  # "" = use the process's current working directory
     "panel_config_path": str(DEFAULT_PANEL_CONFIG_PATH),
     "reference_tolerance_pct": norm_analysis.DEFAULT_TOLERANCE * 100.0,
+    # Lightbox mode (--lightbox)
+    "lightbox_campaign_path": "",  # last calibration folder chosen; none built in
+    "lightbox_deviation_warn_pct": 5.0,
+    "lightbox_trim_tolerance_pct": 2.0,
+    "lightbox_irr_node": lbm.DEFAULT_IRR_NODE,
+    "lightbox_lux_node": lbm.DEFAULT_LUX_NODE,
 }
+
+# Settings tab: description and validation per key. kind: "path" / "text" /
+# "float" (min, strict) / "node". read_only keys are shown but set elsewhere.
+_SETTINGS_META = {
+    "otii_exe": ("path", "Otii 3 executable, used to restart Otii if it stops responding."),
+    "otii_restart_wait_seconds": ("float", "Seconds to wait after restarting Otii before reconnecting.", 0.0, False),
+    "iv_timeout_seconds": ("float", "Maximum IV sweep time before it is aborted (same as Sweep Timeout on the Measure tab).", 0.0, True),
+    "otii_call_timeout_seconds": ("float", "Timeout for a single Otii call before the connection counts as lost.", 0.0, True),
+    "summary_csv": ("path", "Summary CSV. Always <working folder>/LowLightTesting_summary.csv; change the working folder instead.", None, None, True),
+    "working_dir": ("path", "Working folder for IV files and the summary CSV (the session there is reloaded)."),
+    "panel_config_path": ("path", "Panel config CSV (panel name, cells, width/height)."),
+    "reference_tolerance_pct": ("float", "Analysis tab: measurements within this % of 1000 W/m² form each panel's reference.", 0.0, True),
+    "lightbox_campaign_path": ("path", "Lightbox: calibration campaign folder (Choose… on the Measure tab sets it too)."),
+    "lightbox_deviation_warn_pct": ("float", "Lightbox: warn at save when a sensor is further than this % from the calibration.", 0.0, False),
+    "lightbox_trim_tolerance_pct": ("float", "Lightbox: the trim dialog shows green within this % of the target.", 0.0, True),
+    "lightbox_irr_node": ("node", "Lightbox: default irradiance sensor grid node."),
+    "lightbox_lux_node": ("node", "Lightbox: default lux sensor grid node."),
+}
+
+
+def parse_setting_value(key: str, text: str, default):
+    """Parse one Settings-tab cell into the value stored in settings.json.
+    Raises ValueError with a readable reason."""
+    meta = _SETTINGS_META.get(key)
+    text = text.strip()
+    kind = meta[0] if meta else ("float" if isinstance(default, (int, float)) and not isinstance(default, bool) else "json")
+    if kind == "float":
+        try:
+            value = float(text)
+        except ValueError:
+            raise ValueError("must be a number") from None
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("must be a finite number")
+        if meta and meta[2] is not None:
+            minimum, strict = meta[2], meta[3]
+            if (strict and value <= minimum) or (not strict and value < minimum):
+                raise ValueError(f"must be {'>' if strict else '>='} {minimum:g}")
+        return value
+    if kind == "node":
+        try:
+            import calibration_model as _cm
+            _cm.parse_node_label(text)
+        except ValueError:
+            raise ValueError("must be a grid node like B6") from None
+        return text.upper()
+    if kind == "json":
+        try:
+            return json.loads(text)
+        except ValueError:
+            return text
+    return text
+
 
 SESSION_CSV_NAME = "LowLightTesting_summary.csv"
 PENDING_MEASUREMENT_FILENAME = ".pending_measurement.json"
@@ -356,6 +429,8 @@ class SettingsDialog(QDialog):
         self.summary_csv_edit = QLineEdit(settings.get("summary_csv", str(DEFAULT_SUMMARY_CSV)))
         self.panel_config_edit = QLineEdit(settings.get("panel_config_path", str(DEFAULT_PANEL_CONFIG_PATH)))
         self.tolerance_edit = QLineEdit(str(settings.get("reference_tolerance_pct", 3.0)))
+        self.lb_dev_edit = QLineEdit(str(settings.get("lightbox_deviation_warn_pct", 5.0)))
+        self.lb_trim_edit = QLineEdit(str(settings.get("lightbox_trim_tolerance_pct", 2.0)))
 
         form.addRow("Otii 3 executable path:", self.otii_exe_edit)
         form.addRow("Otii restart wait (s):", self.restart_wait_edit)
@@ -364,6 +439,8 @@ class SettingsDialog(QDialog):
         form.addRow("Summary CSV path:", self.summary_csv_edit)
         form.addRow("Panel config file:", self.panel_config_edit)
         form.addRow("1000 W/m² reference tolerance (%):", self.tolerance_edit)
+        form.addRow("Lightbox: warn when a sensor deviates by more than (%):", self.lb_dev_edit)
+        form.addRow("Lightbox: trim tolerance, shown green within (%):", self.lb_trim_edit)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(
@@ -388,6 +465,8 @@ class SettingsDialog(QDialog):
             "summary_csv": self.summary_csv_edit.text().strip() or str(DEFAULT_SUMMARY_CSV),
             "panel_config_path": self.panel_config_edit.text().strip() or str(DEFAULT_PANEL_CONFIG_PATH),
             "reference_tolerance_pct": _float(self.tolerance_edit, 3.0),
+            "lightbox_deviation_warn_pct": abs(_float(self.lb_dev_edit, 5.0)),
+            "lightbox_trim_tolerance_pct": abs(_float(self.lb_trim_edit, 2.0)),
         }
 
 
@@ -401,9 +480,15 @@ class LowLightApp(QMainWindow):
     AUTO_RESTART_WINDOW_S = 5 * 60.0
     _ui_call = pyqtSignal(object)  # marshals a zero-arg callable to the main thread
 
-    def __init__(self):
+    def __init__(self, lightbox: bool = False):
         super().__init__()
         self.settings = load_settings()
+        # Lightbox mode: calibrated indoor lightbox, one setpoint per round
+        # (see lightbox_mode.py). Everything it adds is hidden otherwise.
+        self.lightbox_mode = lightbox
+        self.lb_calibration: lbm.Calibration | None = None
+        self.lb_round: lbm.Round | None = None
+        self._last_lightbox_ctx: dict | None = None
 
         def _run_marshaled_fn(fn):
             try:
@@ -472,6 +557,12 @@ class LowLightApp(QMainWindow):
         self.panel_config: dict = {}
         self._reload_panel_config()
 
+        if self.lightbox_mode:
+            saved = self.settings.get("lightbox_campaign_path") or ""
+            if saved:
+                self._lightbox_load_calibration(saved, quiet=True)
+            self._lightbox_refresh_info()
+
         # Restore the last-used working folder (if any) and reload whatever
         # session already lives there, for continuity across app launches.
         initial_wd = self.settings.get("working_dir") or str(Path.cwd())
@@ -539,7 +630,10 @@ class LowLightApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        self.setWindowTitle("Low Light IV Tester — Voltaic Systems")
+        self.setWindowTitle(
+            "Low Light IV Tester — Lightbox — Voltaic Systems" if self.lightbox_mode
+            else "Low Light IV Tester — Voltaic Systems"
+        )
         self.setStyleSheet(_STYLESHEET)
 
         central = QWidget()
@@ -556,7 +650,7 @@ class LowLightApp(QMainWindow):
         hlay.setContentsMargins(14, 0, 14, 0)
         hlay.setSpacing(14)
 
-        title = QLabel("LOW LIGHT IV TESTER")
+        title = QLabel("LOW LIGHT IV TESTER — LIGHTBOX" if self.lightbox_mode else "LOW LIGHT IV TESTER")
         title.setStyleSheet("color:#ffffff; font-size:15pt; font-weight:bold; background:transparent;")
         hlay.addWidget(title)
         hlay.addStretch()
@@ -744,6 +838,12 @@ class LowLightApp(QMainWindow):
         self.sweep_timeout_edit.editingFinished.connect(self._guard(self._commit_sweep_timeout))
         panel_form.addRow("Sweep Timeout (s):", self.sweep_timeout_edit)
         clay.addLayout(panel_form)
+        if self.lightbox_mode:
+            # The round's setpoint is the solar intensity; it's written into
+            # si_edit so file names, plot titles and the saved row use it.
+            panel_form.setRowVisible(self.si_edit, False)
+            self.si_edit.setText("")
+            clay.addWidget(self._build_lightbox_group())
 
         self.btn_run = QPushButton("Run Test  (Ctrl+R)")
         self.btn_run.setProperty("primary", True)
@@ -817,9 +917,15 @@ class LowLightApp(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        for col in range(1, len(_COLUMNS) - 1):
+        for col in range(1, len(_COLUMNS)):
             hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(len(_COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
+        if self.lightbox_mode:
+            hdr.setSectionResizeMode(_NOTES_COL, QHeaderView.ResizeMode.Interactive)
+            self.table.setColumnWidth(_NOTES_COL, 160)
+        else:
+            hdr.setSectionResizeMode(_NOTES_COL, QHeaderView.ResizeMode.Stretch)
+            for col in range(_NOTES_COL + 1, len(_COLUMNS)):
+                self.table.setColumnHidden(col, True)
         self.table.setColumnWidth(0, 120)
         copy_sc = QShortcut(QKeySequence.StandardKey.Copy, self.table)
         copy_sc.activated.connect(self._guard(self._copy_table_selection))
@@ -844,6 +950,11 @@ class LowLightApp(QMainWindow):
 
         self._tab_widget.addTab(self._build_analysis_tab(), "Analysis")
         self._tab_widget.addTab(self._build_panel_config_tab(), "Panel Config")
+        self._settings_tab_index = self._tab_widget.addTab(self._build_settings_tab(), "Settings")
+        # Other controls (Sweep Timeout box, working folder, calibration
+        # Choose…, the Settings dialog) also change settings, so the tab is
+        # re-read whenever it's opened unless it holds unsaved edits.
+        self._tab_widget.currentChanged.connect(self._guard1(self._on_tab_changed))
 
     def _build_analysis_tab(self) -> QWidget:
         tab = QWidget()
@@ -930,8 +1041,9 @@ class LowLightApp(QMainWindow):
         intro = QLabel(
             "One row per panel, keyed by the exact Panel Name entered on the Measure tab "
             "(case-insensitive). Each panel is normalized against its own 1000 W/m² "
-            "measurements on the Analysis tab. Edits here save to the panel config file "
-            "and refresh the Analysis tab automatically."
+            "measurements on the Analysis tab. Width and Height are only needed for the "
+            "lightbox: width runs along columns A–K and should be the longer side. Edits here "
+            "save to the panel config file and refresh the Analysis tab automatically."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color:#555; font-size:9pt;")
@@ -943,15 +1055,17 @@ class LowLightApp(QMainWindow):
         layout.addWidget(self.panel_config_status_lbl)
 
         self.panel_config_table = QTableWidget()
-        self.panel_config_table.setColumnCount(4)
+        self.panel_config_table.setColumnCount(6)
         self.panel_config_table.setHorizontalHeaderLabels(
-            ["Panel Name", "Cell Type", "Cells Series", "Cells Parallel"]
+            ["Panel Name", "Cell Type", "Cells Series", "Cells Parallel", "Width (mm)", "Height (mm)"]
         )
         hdr = self.panel_config_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
         self.panel_config_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.panel_config_table.itemChanged.connect(self._guard(self._on_panel_config_table_changed))
         layout.addWidget(self.panel_config_table, 1)
@@ -1042,13 +1156,16 @@ class LowLightApp(QMainWindow):
             self.panel_config_table.setItem(r, 1, QTableWidgetItem(entry["cell_type"]))
             self.panel_config_table.setItem(r, 2, QTableWidgetItem(str(entry["cells_series"])))
             self.panel_config_table.setItem(r, 3, QTableWidgetItem(str(entry["cells_parallel"])))
+            for c, key in ((4, "width_mm"), (5, "height_mm")):
+                value = entry.get(key)
+                self.panel_config_table.setItem(r, c, QTableWidgetItem("" if value is None else f"{value:g}"))
         self.panel_config_table.blockSignals(False)
 
     def _add_panel_config_row(self) -> None:
         self.panel_config_table.blockSignals(True)
         r = self.panel_config_table.rowCount()
         self.panel_config_table.insertRow(r)
-        for c, default in enumerate(("", "", "1", "1")):
+        for c, default in enumerate(("", "", "1", "1", "", "")):
             self.panel_config_table.setItem(r, c, QTableWidgetItem(default))
         self.panel_config_table.blockSignals(False)
         self.panel_config_table.editItem(self.panel_config_table.item(r, 0))
@@ -1090,7 +1207,7 @@ class LowLightApp(QMainWindow):
         for key in sorted(missing):
             r = self.panel_config_table.rowCount()
             self.panel_config_table.insertRow(r)
-            for c, value in enumerate((missing[key], "", "", "")):
+            for c, value in enumerate((missing[key], "", "", "", "", "")):
                 self.panel_config_table.setItem(r, c, QTableWidgetItem(value))
         self.panel_config_table.blockSignals(False)
         self.panel_config_status_lbl.setText(
@@ -1116,6 +1233,7 @@ class LowLightApp(QMainWindow):
         invalid_rows = 0
         incomplete_rows = 0
         duplicate_rows = 0
+        invalid_dims = 0
         seen = set()
 
         def _text(r, c):
@@ -1139,11 +1257,19 @@ class LowLightApp(QMainWindow):
             except ValueError:
                 invalid_rows += 1
                 continue
+            try:
+                width_mm = norm_analysis.parse_dimension_mm(_text(r, 4))
+                height_mm = norm_analysis.parse_dimension_mm(_text(r, 5))
+            except ValueError:
+                invalid_dims += 1
+                continue
             seen.add(key)
             config[name] = {
                 "cell_type": _text(r, 1),
                 "cells_series": cells_series,
                 "cells_parallel": cells_parallel,
+                "width_mm": width_mm,
+                "height_mm": height_mm,
             }
 
         self.panel_config = config
@@ -1159,6 +1285,8 @@ class LowLightApp(QMainWindow):
             status += f" {incomplete_rows} row(s) not saved yet (Cells Series/Parallel blank)."
         if duplicate_rows:
             status += f" {duplicate_rows} duplicate Panel Name row(s) ignored (first one kept)."
+        if invalid_dims:
+            status += f" {invalid_dims} row(s) skipped (Width/Height must be blank or a number > 0)."
         self.panel_config_status_lbl.setText(status)
         self.panel_config_lbl.setText(f"Panel config: {path} ({len(self.panel_config)} entries)")
 
@@ -1496,6 +1624,193 @@ class LowLightApp(QMainWindow):
     # Settings dialog
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Settings tab: edit cache/settings.json in place
+    # ------------------------------------------------------------------
+
+    def _build_settings_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        intro = QLabel(
+            f"Every value in {CACHE_DIR / 'settings.json'}. Edit a Value cell, then Apply && Save. "
+            "Invalid entries are highlighted and nothing is saved until they're fixed. "
+            "Grey rows are set elsewhere and shown for reference."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#555; font-size:9pt;")
+        layout.addWidget(intro)
+
+        self.settings_status_lbl = QLabel("")
+        self.settings_status_lbl.setWordWrap(True)
+        self.settings_status_lbl.setStyleSheet("color:#444; font-size:9pt;")
+        layout.addWidget(self.settings_status_lbl)
+
+        self.settings_table = QTableWidget()
+        self.settings_table.setColumnCount(4)
+        self.settings_table.setHorizontalHeaderLabels(["Setting", "Value", "Default", "Description"])
+        hdr = self.settings_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.settings_table.setColumnWidth(1, 380)
+        self.settings_table.setColumnWidth(2, 160)
+        self.settings_table.setWordWrap(False)
+        self.settings_table.itemChanged.connect(self._guard1(self._on_settings_item_changed))
+        layout.addWidget(self.settings_table, 1)
+
+        btn_row = QHBoxLayout()
+        apply_btn = QPushButton("Apply && Save")
+        apply_btn.setProperty("primary", True)
+        apply_btn.clicked.connect(self._guard(self._apply_settings_tab))
+        discard_btn = QPushButton("Discard Edits")
+        discard_btn.setToolTip("Re-read the current settings, dropping unsaved edits in this table")
+        discard_btn.clicked.connect(self._guard(self._populate_settings_tab))
+        defaults_btn = QPushButton("Reset Row to Default")
+        defaults_btn.setToolTip("Put the default value into the selected row(s); Apply && Save to keep it")
+        defaults_btn.clicked.connect(self._guard(self._reset_settings_rows_to_default))
+        for b in (apply_btn, discard_btn, defaults_btn):
+            btn_row.addWidget(b)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self._settings_dirty = False
+        self._populate_settings_tab()
+        return tab
+
+    @staticmethod
+    def _setting_text(value) -> str:
+        if isinstance(value, float):
+            return f"{value:g}"
+        if isinstance(value, str):
+            return value
+        return json.dumps(value)
+
+    def _settings_keys(self) -> list:
+        return list(DEFAULT_SETTINGS) + sorted(k for k in self.settings if k not in DEFAULT_SETTINGS)
+
+    def _populate_settings_tab(self) -> None:
+        t = self.settings_table
+        t.blockSignals(True)
+        t.setRowCount(0)
+        for key in self._settings_keys():
+            meta = _SETTINGS_META.get(key)
+            read_only = bool(meta and len(meta) > 4 and meta[4])
+            r = t.rowCount()
+            t.insertRow(r)
+            items = [
+                QTableWidgetItem(key),
+                QTableWidgetItem(self._setting_text(self.settings.get(key, DEFAULT_SETTINGS.get(key, "")))),
+                QTableWidgetItem(self._setting_text(DEFAULT_SETTINGS[key]) if key in DEFAULT_SETTINGS else "(not a built-in setting)"),
+                QTableWidgetItem(meta[1] if meta else ""),
+            ]
+            for c, item in enumerate(items):
+                if c != 1 or read_only:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if read_only:
+                    item.setForeground(QBrush(QColor("#888888")))
+                item.setToolTip(items[1].text() if c == 1 else items[3].text())
+                t.setItem(r, c, item)
+        t.blockSignals(False)
+        self._settings_dirty = False
+        self.settings_status_lbl.setText(f"{len(self._settings_keys())} settings loaded.")
+        self.settings_status_lbl.setStyleSheet("color:#444; font-size:9pt;")
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index == self._settings_tab_index and not self._settings_dirty:
+            self._populate_settings_tab()
+
+    def _on_settings_item_changed(self, item) -> None:
+        if item.column() != 1:
+            return
+        self._settings_dirty = True
+        key = self.settings_table.item(item.row(), 0).text()
+        self.settings_table.blockSignals(True)
+        try:
+            parse_setting_value(key, item.text(), DEFAULT_SETTINGS.get(key))
+            item.setBackground(QBrush())
+            item.setToolTip(item.text())
+        except ValueError as e:
+            item.setBackground(QBrush(QColor("#ffe08a")))
+            item.setToolTip(f"{key} {e}")
+        finally:
+            self.settings_table.blockSignals(False)
+        self.settings_status_lbl.setText("Unsaved edits: click Apply && Save.")
+        self.settings_status_lbl.setStyleSheet("color:#8a5300; font-size:9pt; font-weight:bold;")
+
+    def _reset_settings_rows_to_default(self) -> None:
+        rows = sorted({i.row() for i in self.settings_table.selectedItems()})
+        if not rows:
+            self.settings_status_lbl.setText("Select the row(s) to reset first.")
+            return
+        for r in rows:
+            key = self.settings_table.item(r, 0).text()
+            value_item = self.settings_table.item(r, 1)
+            if key in DEFAULT_SETTINGS and value_item.flags() & Qt.ItemFlag.ItemIsEditable:
+                value_item.setText(self._setting_text(DEFAULT_SETTINGS[key]))
+
+    def _apply_settings_tab(self) -> None:
+        """Validate every row, then save and apply what changed. Nothing is
+        saved if any row is invalid."""
+        new, errors = {}, []
+        for r in range(self.settings_table.rowCount()):
+            key = self.settings_table.item(r, 0).text()
+            item = self.settings_table.item(r, 1)
+            if not item.flags() & Qt.ItemFlag.ItemIsEditable:
+                continue
+            try:
+                new[key] = parse_setting_value(key, item.text(), DEFAULT_SETTINGS.get(key))
+            except ValueError as e:
+                errors.append(f"{key} {e}")
+        if errors:
+            self.settings_status_lbl.setText("Not saved: " + "; ".join(errors))
+            self.settings_status_lbl.setStyleSheet("color:#c53030; font-size:9pt; font-weight:bold;")
+            return
+        changed = {k: v for k, v in new.items() if self.settings.get(k) != v}
+        if not changed:
+            self._settings_dirty = False
+            self.settings_status_lbl.setText("No changes.")
+            self.settings_status_lbl.setStyleSheet("color:#444; font-size:9pt;")
+            return
+        self._apply_settings_changes(dict(changed))
+        self._populate_settings_tab()
+        self.settings_status_lbl.setText(f"Saved {len(changed)} change(s): {', '.join(changed)}.")
+        self.settings_status_lbl.setStyleSheet("color:#1b8a5a; font-size:9pt; font-weight:bold;")
+
+    def _apply_settings_changes(self, changed: dict) -> None:
+        """Store `changed` in self.settings, save settings.json, and push the
+        new values to whatever already uses them."""
+        new_wd = changed.pop("working_dir", None)
+        new_cal = changed.pop("lightbox_campaign_path", None)
+        self.settings.update(changed)
+        save_settings(self.settings)
+        if "iv_timeout_seconds" in changed:
+            self.sweep_timeout_edit.setText(f"{self.settings['iv_timeout_seconds']:g}")
+        if "panel_config_path" in changed or "reference_tolerance_pct" in changed:
+            self._reload_panel_config()
+        if new_wd is not None:
+            if new_wd and not Path(new_wd).is_dir():
+                self.set_status(f"Working folder {new_wd} does not exist; kept {self.working_dir}.", "warning")
+            else:
+                self._apply_working_dir(Path(new_wd) if new_wd else Path.cwd(), persist=True)
+        if self.lightbox_mode:
+            if new_cal is not None:
+                if new_cal:
+                    self._lightbox_load_calibration(new_cal)
+                else:
+                    self.settings["lightbox_campaign_path"] = ""
+                    save_settings(self.settings)
+            for key, combo in (("lightbox_irr_node", self.lb_irr_node_combo), ("lightbox_lux_node", self.lb_lux_node_combo)):
+                if key in changed:
+                    combo.setCurrentText(self.settings[key])
+            self._lightbox_refresh_info()
+        elif new_cal is not None:
+            self.settings["lightbox_campaign_path"] = new_cal
+            save_settings(self.settings)
+
     def _open_settings_dialog(self):
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -1504,6 +1819,9 @@ class LowLightApp(QMainWindow):
             self.sweep_timeout_edit.setText(f"{self.settings['iv_timeout_seconds']:g}")
             # panel_config_path / reference_tolerance_pct may have changed.
             self._reload_panel_config()
+            if self.lightbox_mode:
+                self._lightbox_refresh_info()
+            self._populate_settings_tab()
 
     def _commit_sweep_timeout(self) -> None:
         """Validate the Measure tab's Sweep Timeout box and persist it as
@@ -1572,6 +1890,8 @@ class LowLightApp(QMainWindow):
         "Wp", "Voc", "Isc", "Vp", "Ip",
         "lux_measured", "irradiance_measured_live", "irradiance_live_samples",
         "lux_stdev", "irradiance_stdev", "lux_3sigma_pct", "irradiance_3sigma_pct",
+        "lightbox_setpoint_wm2", "panel_width_mm", "panel_height_mm", "vac_target", "vac_set",
+        "irr_dark_offset", "irr_expected", "irr_deviation_pct", "lux_expected", "lux_deviation_pct",
     )
 
     def _load_session_from_folder(self, folder: Path) -> int:
@@ -2085,9 +2405,19 @@ class LowLightApp(QMainWindow):
         # an edit still sitting in the box wouldn't have fired
         # editingFinished yet.
         self._commit_sweep_timeout()
+        lightbox_ctx = None
+        if self.lightbox_mode:
+            if self.otii_project is None or not self.otii_devices:
+                self.set_status("No instrument connected", "error")
+                return
+            # All dialogs (setpoint, dark offset, next panel, light trim) run
+            # here on the main thread, before anything is disabled.
+            lightbox_ctx = self._lightbox_prepare_run()
+            if lightbox_ctx is None:
+                return
         self.btn_run.setEnabled(False)
         self.btn_connect.setEnabled(False)
-        if not self._launch_task(self._async_start_measurement()):
+        if not self._launch_task(self._async_start_measurement(lightbox_ctx)):
             self.btn_run.setEnabled(True)
             self.btn_connect.setEnabled(True)
 
@@ -2122,7 +2452,7 @@ class LowLightApp(QMainWindow):
                 continue
             return text
 
-    async def _async_start_measurement(self):
+    async def _async_start_measurement(self, lightbox_ctx=None):
         # QLineEdit.text() must be read on the main thread; grab everything
         # this coroutine needs up front so nothing later has to touch a
         # widget directly from the async worker thread.
@@ -2288,6 +2618,7 @@ class LowLightApp(QMainWindow):
         self._on_main(self._redraw_timeseries)
         self._measuring = False
         self._last_metrics = metrics
+        self._last_lightbox_ctx = lightbox_ctx
         self._last_measurement_window = (marker[0], marker[1])
         self._on_main(lambda: self.btn_connect.setEnabled(True))
 
@@ -2328,6 +2659,305 @@ class LowLightApp(QMainWindow):
             self.btn_save.setEnabled(True)
         self._on_main(_finish_ui)
         self.set_status("Measurement complete — review the plot, then Save This Test", "success")
+
+    # ------------------------------------------------------------------
+    # Lightbox mode (--lightbox): calibrated indoor lightbox, one setpoint
+    # per round. Logic and dialogs live in lightbox_mode.py.
+    # ------------------------------------------------------------------
+
+    def _build_lightbox_group(self) -> QWidget:
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(4)
+        lay.addWidget(self._section_label("LIGHTBOX"))
+
+        cal_row = QHBoxLayout()
+        self.lb_cal_lbl = QLabel("Calibration: (none chosen)")
+        self.lb_cal_lbl.setWordWrap(True)
+        self.lb_cal_lbl.setStyleSheet("font-size:9pt;")
+        cal_btn = QPushButton("Choose…")
+        cal_btn.setToolTip("Choose the calibration campaign folder (contains campaign.json and captures.csv)")
+        cal_btn.clicked.connect(self._guard(self._lightbox_choose_calibration))
+        cal_row.addWidget(self.lb_cal_lbl, 1)
+        cal_row.addWidget(cal_btn)
+        lay.addLayout(cal_row)
+
+        round_row = QHBoxLayout()
+        self.lb_round_lbl = QLabel("Setpoint: (no round yet)")
+        self.lb_round_lbl.setWordWrap(True)
+        self.lb_round_lbl.setStyleSheet("font-size:10pt; font-weight:bold;")
+        new_round_btn = QPushButton("New Round…")
+        new_round_btn.setToolTip("Start a new round: new setpoint and a fresh dark-offset reading")
+        new_round_btn.clicked.connect(self._guard(self._lightbox_new_round))
+        round_row.addWidget(self.lb_round_lbl, 1)
+        round_row.addWidget(new_round_btn)
+        lay.addLayout(round_row)
+
+        node_form = QFormLayout()
+        labels = self._lightbox_node_labels()
+        self.lb_irr_node_combo = QComboBox()
+        self.lb_lux_node_combo = QComboBox()
+        for combo, key in ((self.lb_irr_node_combo, "lightbox_irr_node"), (self.lb_lux_node_combo, "lightbox_lux_node")):
+            combo.addItems(labels)
+            combo.setCurrentText(self.settings.get(key) or "")
+            combo.currentTextChanged.connect(self._guard1(self._on_lightbox_node_changed))
+        node_form.addRow("Irradiance sensor node:", self.lb_irr_node_combo)
+        node_form.addRow("Lux sensor node:", self.lb_lux_node_combo)
+        lay.addLayout(node_form)
+
+        self.lb_info_lbl = QLabel("")
+        self.lb_info_lbl.setWordWrap(True)
+        self.lb_info_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.lb_info_lbl.setStyleSheet("font-size:9pt; color:#333;")
+        lay.addWidget(self.lb_info_lbl)
+        return box
+
+    def _lightbox_node_labels(self) -> list:
+        if self.lb_calibration is not None:
+            return self.lb_calibration.node_labels()
+        return lbm.cm.all_node_labels(lbm.cm.GridConfig())
+
+    def _lightbox_choose_calibration(self) -> bool:
+        start = self.settings.get("lightbox_campaign_path") or str(PROJECT_ROOT / "calibration")
+        chosen = QFileDialog.getExistingDirectory(self, "Choose Calibration Campaign Folder", start)
+        if not chosen:
+            return False
+        return self._lightbox_load_calibration(chosen)
+
+    def _lightbox_load_calibration(self, folder, quiet: bool = False) -> bool:
+        """Load a calibration campaign folder. On failure the previous
+        calibration (if any) is kept. A different folder ends the round,
+        since the light setting came from the old calibration."""
+        try:
+            cal = lbm.Calibration(folder)
+        except Exception as e:
+            msg = f"Could not use {folder} as the lightbox calibration: {e}"
+            self.set_status(msg + (" Keeping the previous calibration." if self.lb_calibration else ""), "warning")
+            if not quiet:
+                QMessageBox.warning(self, "Calibration not loaded", msg)
+            self._lightbox_refresh_info()
+            return False
+        changed = self.lb_calibration is None or Path(self.lb_calibration.folder) != Path(cal.folder)
+        self.lb_calibration = cal
+        self.settings["lightbox_campaign_path"] = str(cal.folder)
+        save_settings(self.settings)
+        if changed and self.lb_round is not None:
+            self.lb_round = None
+            self.set_status(f"Calibration changed to {cal.summary}. Start a new round (setpoint + dark offset).", "warning")
+        else:
+            self.set_status(f"Lightbox calibration: {cal.summary}", "info")
+        labels = cal.node_labels()
+        for combo in (self.lb_irr_node_combo, self.lb_lux_node_combo):
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(labels)
+            combo.setCurrentText(current if current in labels else labels[0])
+            combo.blockSignals(False)
+        self._lightbox_refresh_info()
+        return True
+
+    def _lightbox_new_round(self) -> bool:
+        """Setpoint dialog, then the dark offset. Returns False if cancelled
+        (the current round, if any, is left untouched)."""
+        if self.lb_calibration is None and not self._lightbox_choose_calibration():
+            return False
+        last = self.lb_round.setpoint if self.lb_round else 1.0
+        setpoint, ok = QInputDialog.getDouble(
+            self, "New Round",
+            "Setpoint: required average irradiance over the panel (W/m²).\n"
+            "Every panel in this round is measured at this setpoint.",
+            last, 0.001, 100000.0, 3,
+        )
+        if not ok:
+            return False
+        dlg = lbm.DarkOffsetDialog(self, self.irr_store.history, lbm.cr.IRR_ZERO_OFFSET_WM2, MIN_IRR_SAMPLES)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        if dlg.source == "measured":
+            QMessageBox.information(self, "Dark offset recorded", "Uncover the irradiance sensor now.")
+        self.lb_round = lbm.Round(setpoint=setpoint, dark_offset=dlg.offset, dark_offset_source=dlg.source)
+        self.si_edit.setText(f"{setpoint:g}")
+        self.set_status(
+            f"New round: {setpoint:g} W/m², dark offset {dlg.offset:.4f} W/m² ({dlg.source}). Run Test to set up the first panel.",
+            "info",
+        )
+        self._lightbox_refresh_info()
+        return True
+
+    def _on_lightbox_node_changed(self, _text) -> None:
+        self.settings["lightbox_irr_node"] = self.lb_irr_node_combo.currentText()
+        self.settings["lightbox_lux_node"] = self.lb_lux_node_combo.currentText()
+        save_settings(self.settings)
+        self._lightbox_refresh_info()
+
+    def _lightbox_expected_now(self):
+        """Expected readings at the current nodes for the round's current
+        light setting, or None."""
+        rd, cal = self.lb_round, self.lb_calibration
+        if rd is None or rd.light is None or cal is None:
+            return None
+        w, h = rd.size
+        try:
+            return cal.expected(rd.light["vac_target"], self.lb_irr_node_combo.currentText(),
+                                self.lb_lux_node_combo.currentText(), w, h)
+        except ValueError:
+            return None
+
+    def _lightbox_refresh_info(self) -> None:
+        if not self.lightbox_mode:
+            return
+        cal, rd = self.lb_calibration, self.lb_round
+        self.lb_cal_lbl.setText(f"Calibration: {cal.summary}" if cal else "Calibration: (none chosen — click Choose…)")
+        if rd is None:
+            self.lb_round_lbl.setText("Setpoint: (no round yet — Run Test or New Round… starts one)")
+            self.lb_info_lbl.setText("")
+            return
+        self.lb_round_lbl.setText(f"Setpoint: {rd.setpoint:g} W/m²   ·   dark offset {rd.dark_offset:.4f} W/m² ({rd.dark_offset_source})")
+        if rd.light is None:
+            self.lb_info_lbl.setText("Light not set yet for this round.")
+            return
+        L = rd.light
+        w, h = rd.size
+        lines = [
+            f"Light set for <b>{w:g} × {h:g} mm</b> (last panel: {rd.last_panel or '—'})",
+            f"Starting VAC {L['vac_target']:.1f} ± {L['vac_unc_v']:.2f} V · VAC as set {L['vac_set']:.1f}",
+            f"Trimmed to {L['irr_target']:.4g} W/m² at {L['irr_node']}",
+        ]
+        exp = self._lightbox_expected_now()
+        if exp is not None:
+            ni, nl = exp["nodes"]["irr"], exp["nodes"]["lux"]
+            lines.append(
+                f"Expected: irr {ni['value']:.4g} W/m² at {ni['node']} · lux {nl['value']:.4g} lx at {nl['node']}"
+                + (" · <span style='color:#8a5300'>a node is filled (glitch/excluded) in the calibration</span>"
+                   if ni["glitch"] or nl["glitch"] else "")
+            )
+        self.lb_info_lbl.setText("<br>".join(lines))
+
+    def _lightbox_live_irr(self):
+        now = time.time()
+        return lbm.window_mean(self.irr_store.history, now - lbm.TRIM_LIVE_WINDOW_S, now)
+
+    def _lightbox_prepare_run(self):
+        """Main-thread dialogs before a lightbox run. Returns the run context
+        (everything the saved row needs) or None if cancelled/blocked."""
+        if self.lb_calibration is None and not self._lightbox_choose_calibration():
+            self.set_status("Choose a calibration folder before running in lightbox mode.", "warning")
+            return None
+        if self.lb_round is None and not self._lightbox_new_round():
+            self.set_status("Run cancelled — no round started.", "info")
+            return None
+        cal, rd = self.lb_calibration, self.lb_round
+
+        dlg = lbm.NextPanelDialog(
+            self, self.panel_name_edit.text().strip(), self.lb_irr_node_combo.currentText(),
+            self.lb_lux_node_combo.currentText(), cal.node_labels(),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.set_status("Run cancelled.", "info")
+            return None
+        panel_name, irr_node, lux_node = dlg.values()
+        self.panel_name_edit.setText(panel_name)
+        self.lb_irr_node_combo.setCurrentText(irr_node)
+        self.lb_lux_node_combo.setCurrentText(lux_node)
+
+        hit = norm_analysis.lookup_panel(panel_name, self.panel_config)
+        if hit is None or hit[1].get("width_mm") is None or hit[1].get("height_mm") is None:
+            what = "is not in the panel config" if hit is None else "has no Width/Height in the panel config"
+            QMessageBox.warning(
+                self, "Panel size needed",
+                f"\"{panel_name}\" {what}. Add it with Width (along A–K) and Height on the Panel Config tab, then Run Test again.",
+            )
+            self.set_status(f"{panel_name}: add Width/Height on the Panel Config tab.", "warning")
+            return None
+        w, h = float(hit[1]["width_mm"]), float(hit[1]["height_mm"])
+        if h > w:
+            QMessageBox.warning(
+                self, "Check orientation",
+                f"\"{panel_name}\" is {w:g} × {h:g} mm: height is larger than width. The calibration assumes "
+                "width along A–K is the longer side. Continuing with the sizes as configured.",
+            )
+
+        if rd.needs_light_setting(w, h):
+            try:
+                light = cal.light_setting(rd.setpoint, w, h, irr_node)
+            except ValueError as e:
+                QMessageBox.warning(self, "Setpoint not reachable", str(e))
+                self.set_status(f"{panel_name}: {e}", "warning")
+                return None
+            trim = lbm.TrimDialog(
+                self, panel_name, (w, h), rd.setpoint, light, rd.dark_offset,
+                self.settings.get("lightbox_trim_tolerance_pct", 2.0), self._lightbox_live_irr,
+            )
+            if trim.exec() != QDialog.DialogCode.Accepted:
+                self.set_status("Run cancelled — light not set.", "info")
+                return None
+            light["vac_set"] = trim.vac_set
+            rd.size, rd.light = (w, h), light
+            self.set_status(
+                f"Light set for {w:g} × {h:g} mm: {light['vac_target']:.1f} VAC target, {trim.vac_set:.1f} VAC as set.", "info"
+            )
+        else:
+            self.set_status(f"Same size as {rd.last_panel}: light unchanged ({rd.light['vac_set']:.1f} VAC).", "info")
+
+        try:
+            exp = cal.expected(rd.light["vac_target"], irr_node, lux_node, w, h)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot predict sensor readings", str(e))
+            return None
+        rd.last_panel = panel_name
+        self.si_edit.setText(f"{rd.setpoint:g}")
+        self._lightbox_refresh_info()
+        return {
+            "setpoint": rd.setpoint, "w": w, "h": h, "dark_offset": rd.dark_offset,
+            "vac_target": rd.light["vac_target"], "vac_set": rd.light["vac_set"],
+            "irr_node": irr_node, "lux_node": lux_node,
+            "irr_expected": exp["nodes"]["irr"]["value"], "lux_expected": exp["nodes"]["lux"]["value"],
+            "campaign": cal.campaign_id if cal.campaign_id == cal.folder.name else f"{cal.campaign_id} ({cal.folder.name})",
+        }
+
+    def _lightbox_row_fields(self, ctx: dict, irr_mean, lux_mean):
+        """Extra summary-CSV fields for a lightbox row, and a warning text if
+        either sensor deviates by more than the threshold (else None)."""
+        irr_meas = irr_mean - ctx["dark_offset"] if irr_mean is not None else None
+        irr_dev = lbm.deviation_pct(irr_meas, ctx["irr_expected"])
+        lux_dev = lbm.deviation_pct(lux_mean, ctx["lux_expected"])
+
+        def num(v, nd=6):
+            return "" if v is None else round(float(v), nd)
+
+        extra = {
+            "lightbox_setpoint_wm2": ctx["setpoint"], "panel_width_mm": ctx["w"], "panel_height_mm": ctx["h"],
+            "vac_target": num(ctx["vac_target"], 2), "vac_set": ctx["vac_set"], "irr_dark_offset": num(ctx["dark_offset"]),
+            "irr_node": ctx["irr_node"], "irr_expected": num(ctx["irr_expected"]), "irr_deviation_pct": num(irr_dev, 2),
+            "lux_node": ctx["lux_node"], "lux_expected": num(ctx["lux_expected"], 4), "lux_deviation_pct": num(lux_dev, 2),
+            "calibration_campaign": ctx["campaign"],
+        }
+        limit = self.settings.get("lightbox_deviation_warn_pct", 5.0)
+        bad = [f"{name} at {node}: {dev:+.1f}%" for name, node, dev in
+               (("Irradiance", ctx["irr_node"], irr_dev), ("Lux", ctx["lux_node"], lux_dev))
+               if dev is not None and abs(dev) > limit]
+        missing = [name for name, v in (("irradiance", irr_mean), ("lux", lux_mean)) if v is None]
+        warning = None
+        if bad or missing:
+            parts = []
+            if bad:
+                parts.append(f"More than ±{limit:g}% from the calibration: " + "; ".join(bad) + ".")
+            if missing:
+                parts.append("No " + " or ".join(missing) + " readings during the sweep, so no deviation.")
+            warning = " ".join(parts)
+        return extra, warning
+
+    def _lightbox_show_deviation(self, run_index, extra: dict, warning) -> None:
+        def fmt(v):
+            return "—" if v in ("", None) else f"{v:+.1f}%"
+        line = (f"Deviation vs calibration: irr {fmt(extra['irr_deviation_pct'])} at {extra['irr_node']}, "
+                f"lux {fmt(extra['lux_deviation_pct'])} at {extra['lux_node']}")
+        self.results_lbl.setText(self.results_lbl.text() + "\n" + line)
+        if warning:
+            self.set_status(f"Saved run {run_index}. {warning}", "warning")
+            QMessageBox.warning(self, "Sensor deviation", f"Run {run_index} was saved.\n\n{warning}")
 
     # ------------------------------------------------------------------
     # Pending-measurement crash-recovery snapshot
@@ -2462,6 +3092,12 @@ class LowLightApp(QMainWindow):
             "samples": irr_count,
         }
 
+        lightbox_extra, deviation_warning = None, None
+        if self.lightbox_mode and self._last_lightbox_ctx is not None:
+            lightbox_extra, deviation_warning = self._lightbox_row_fields(
+                self._last_lightbox_ctx, irr_mean, lux_mean
+            )
+
         try:
             summary_csv = self.settings["summary_csv"]
             if self._next_run_index <= 1:
@@ -2485,6 +3121,7 @@ class LowLightApp(QMainWindow):
             irradiance_stdev=irr_stdev if irr_stdev is not None else "",
             lux_3sigma_pct=lux_3sigma_pct if lux_3sigma_pct is not None else "",
             irradiance_3sigma_pct=irr_3sigma_pct if irr_3sigma_pct is not None else "",
+            extra=lightbox_extra,
         )
 
         try:
@@ -2517,6 +3154,9 @@ class LowLightApp(QMainWindow):
         self.btn_save.setEnabled(False)
         self._clear_pending_measurement_snapshot()
 
+        if lightbox_extra is not None:
+            self._lightbox_show_deviation(run_index, lightbox_extra, deviation_warning)
+
     def _append_table_row(self, row: dict):
         self.table.blockSignals(True)
         r = self.table.rowCount()
@@ -2547,6 +3187,14 @@ class LowLightApp(QMainWindow):
             f"{row.get('irradiance_3sigma_pct', ''):.1f}" if row.get("irradiance_3sigma_pct") not in ("", None) else "",
             row.get("notes", ""),
         ]
+        for _header, key, spec in _LIGHTBOX_COLUMNS:
+            value = row.get(key, "")
+            if spec and value not in ("", None):
+                try:
+                    value = format(float(value), spec)
+                except (TypeError, ValueError):
+                    pass
+            values.append("" if value is None else value)
         for col, value in enumerate(values):
             self.table.setItem(r, col, _item(value, col in _EDITABLE_COLS))
 
@@ -2731,8 +3379,10 @@ class _SafeApplication(QApplication):
 
 
 def main():
-    app = _SafeApplication(sys.argv)
-    window = LowLightApp()
+    lightbox = "--lightbox" in sys.argv[1:]
+    argv = [a for a in sys.argv if a != "--lightbox"]
+    app = _SafeApplication(argv)
+    window = LowLightApp(lightbox=lightbox)
     window.showMaximized()
 
     def _handle_exception(loop, context):
