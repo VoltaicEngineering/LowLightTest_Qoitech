@@ -60,7 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import calibration_model as cm
 import sensors
-from ui_style import _STYLESHEET, _STAGE_STYLE, open_in_explorer
+from ui_style import _STYLESHEET, _STAGE_STYLE, apply_light_theme, open_in_explorer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CALIBRATION_DIR = PROJECT_ROOT / "calibration"
@@ -1708,6 +1708,7 @@ def main() -> int:
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
+    apply_light_theme(app)
     window = LightboxCalibrationApp(simulate=args.simulate)
     window.show()
     return app.exec()

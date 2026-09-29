@@ -91,7 +91,7 @@ from sensors import (
     HistoryIrradiance,
     lux_poll_loop,
 )
-from ui_style import _STYLESHEET, _STAGE_STYLE, open_in_explorer
+from ui_style import _STYLESHEET, _STAGE_STYLE, apply_light_theme, open_in_explorer
 from IV_curve_CURRENT_V3 import (
     append_summary_csv,
     build_clipboard_row,
@@ -3688,6 +3688,7 @@ def main():
     lightbox = "--lightbox" in sys.argv[1:]
     argv = [a for a in sys.argv if a != "--lightbox"]
     app = _SafeApplication(argv)
+    apply_light_theme(app)
     holder = {"window": None}
     install_exception_hooks(lambda: holder["window"])
     window = LowLightApp(lightbox=lightbox)

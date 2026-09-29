@@ -55,6 +55,7 @@ QPushButton[danger="true"]:hover { background-color: #9b1c1c; border-color: #7b1
 QLabel { background: transparent; }
 QLineEdit {
     background-color: #ffffff;
+    color: #1a1a1a;
     border: 2px solid #9aa0a6;
     border-radius: 4px;
     padding: 4px 6px;
@@ -62,6 +63,7 @@ QLineEdit {
 }
 QComboBox {
     background-color: #ffffff;
+    color: #1a1a1a;
     border: 2px solid #9aa0a6;
     border-radius: 4px;
     padding: 4px 6px;
@@ -100,7 +102,66 @@ QProgressBar {
 QProgressBar::chunk { background-color: #1a56db; border-radius: 3px; }
 
 QSplitter::handle { background: #c0c4cc; }
+
+/* Tabs, dropdown lists and tooltips get explicit colours: left to the
+   system theme, a PC in Windows dark mode drew them as light text on this
+   light background (tab labels were nearly invisible). */
+QTabWidget::pane { border: 1px solid #c0c4cc; top: -1px; }
+QTabBar::tab {
+    background-color: #dfe3e8;
+    color: #1a1a1a;
+    border: 1px solid #b0b5bc;
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+    padding: 5px 14px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected { background-color: #1a56db; color: #ffffff; border-color: #1246c0; }
+QTabBar::tab:hover:!selected { background-color: #cfd6e0; }
+QComboBox QAbstractItemView {
+    background-color: #ffffff;
+    color: #1a1a1a;
+    selection-background-color: #1a56db;
+    selection-color: #ffffff;
+}
+QToolTip { background-color: #ffffe1; color: #1a1a1a; border: 1px solid #9aa0a6; }
 """
+
+
+def apply_light_theme(app) -> None:
+    """Force a light colour scheme and palette on the whole application, so
+    anything the stylesheet doesn't reach (message boxes, input dialogs,
+    menus, scrollbars) stays dark-on-light when Windows is in dark mode."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QColor, QPalette
+
+    hints = app.styleHints()
+    if hasattr(hints, "setColorScheme"):  # Qt 6.8+
+        hints.setColorScheme(Qt.ColorScheme.Light)
+
+    pal = QPalette()
+    roles = {
+        QPalette.ColorRole.Window: "#f0f2f5",
+        QPalette.ColorRole.WindowText: "#1a1a1a",
+        QPalette.ColorRole.Base: "#ffffff",
+        QPalette.ColorRole.AlternateBase: "#f5f6f8",
+        QPalette.ColorRole.Text: "#1a1a1a",
+        QPalette.ColorRole.Button: "#ffffff",
+        QPalette.ColorRole.ButtonText: "#1a1a1a",
+        QPalette.ColorRole.ToolTipBase: "#ffffe1",
+        QPalette.ColorRole.ToolTipText: "#1a1a1a",
+        QPalette.ColorRole.PlaceholderText: "#7a7f86",
+        QPalette.ColorRole.Highlight: "#1a56db",
+        QPalette.ColorRole.HighlightedText: "#ffffff",
+        QPalette.ColorRole.Link: "#1a56db",
+        QPalette.ColorRole.BrightText: "#ffffff",
+    }
+    for role, color in roles.items():
+        pal.setColor(role, QColor(color))
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor("#9aa0a6"))
+    app.setPalette(pal)
 
 _STAGE_STYLE = {
     "info": "background:#e8eaed; color:#333333; border:1px solid #9aa0a6; border-radius:5px; padding:8px; font-weight:bold;",
