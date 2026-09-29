@@ -581,9 +581,12 @@ SUMMARY_CSV_FIELDNAMES = [
     "irradiance_3sigma_pct",
     "png_path",
     "csv_path",
-    # Lightbox mode only (blank otherwise). irradiance_measured_live stays
-    # the raw sensor mean; irr_deviation_pct compares it minus
-    # irr_dark_offset against irr_expected.
+    # Lightbox mode only (blank otherwise), except irr_dark_offset and
+    # irradiance_raw below. Rows saved since 2026-09-29 with irr_dark_offset
+    # set log irradiance_measured_live with that offset already subtracted
+    # (irradiance_raw holds the raw sensor mean); older lightbox rows kept
+    # irradiance_measured_live raw. irr_deviation_pct compares
+    # raw - irr_dark_offset against irr_expected.
     "lightbox_setpoint_wm2",
     "panel_width_mm",
     "panel_height_mm",
@@ -597,6 +600,7 @@ SUMMARY_CSV_FIELDNAMES = [
     "lux_expected",
     "lux_deviation_pct",
     "calibration_campaign",
+    "irradiance_raw",
 ]
 
 

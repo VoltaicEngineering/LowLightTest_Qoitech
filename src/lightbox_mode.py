@@ -164,9 +164,11 @@ class NextPanelDialog(QDialog):
 
 class DarkOffsetDialog(QDialog):
     """Cover the irradiance sensor, wait DARK_SETTLE_S, average DARK_COLLECT_S
-    of samples. `self.offset` / `self.source` are set on accept."""
+    of samples. `self.offset` / `self.source` are set on accept.
+    stored_offset: (value, captured_at) from the Irr Zero Offset tab, offered
+    as another choice when given."""
 
-    def __init__(self, parent, history, reference_offset: float, min_samples: int):
+    def __init__(self, parent, history, reference_offset: float, min_samples: int, stored_offset=None):
         super().__init__(parent)
         self.setWindowTitle("Irradiance Dark Offset")
         self.history = history
@@ -198,9 +200,17 @@ class DarkOffsetDialog(QDialog):
         self.fallback_btn = QPushButton(f"Use Calibration Offset ({reference_offset:g})")
         self.fallback_btn.setToolTip("Skip the dark reading and use the calibration campaign's fixed offset")
         self.fallback_btn.clicked.connect(self._use_reference)
+        buttons = [self.start_btn, self.use_btn]
+        self.stored_offset = stored_offset
+        if stored_offset is not None:
+            value, captured_at = stored_offset
+            self.stored_btn = QPushButton(f"Use Zero-Offset Tab ({value:.4f}{', ' + captured_at if captured_at else ''})")
+            self.stored_btn.setToolTip("Skip the dark reading and use the offset captured on the Irr Zero Offset tab")
+            self.stored_btn.clicked.connect(self._use_stored)
+            buttons.append(self.stored_btn)
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
-        for b in (self.start_btn, self.use_btn, self.fallback_btn, cancel):
+        for b in buttons + [self.fallback_btn, cancel]:
             row.addWidget(b)
         lay.addLayout(row)
 
@@ -246,6 +256,11 @@ class DarkOffsetDialog(QDialog):
 
     def _use_measured(self):
         self.offset, self.source = self._measured, "measured"
+        self._timer.stop()
+        self.accept()
+
+    def _use_stored(self):
+        self.offset, self.source = self.stored_offset[0], "zero-offset tab"
         self._timer.stop()
         self.accept()
 

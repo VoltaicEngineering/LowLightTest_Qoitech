@@ -69,6 +69,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lightbox_mode as lbm
 import norm_analysis
 import sensors
+import zero_offset
 from triplett_lt68_probe_v3 import LT68
 from listen import RollingIrradiance, serial_reader
 from sensors import (
@@ -502,6 +503,11 @@ class LowLightApp(QMainWindow):
         self.lb_calibration: lbm.Calibration | None = None
         self.lb_round: lbm.Round | None = None
         self._last_lightbox_ctx: dict | None = None
+        # Irradiance zero offset captured on the Irr Zero Offset tab. Applies
+        # for the rest of this session only (live readout, plot, logged
+        # values); not saved, so each session starts uncorrected.
+        self.irr_zero_offset: float | None = None
+        self.irr_zero_offset_info = ""
 
         def _run_marshaled_fn(fn):
             try:
@@ -963,6 +969,7 @@ class LowLightApp(QMainWindow):
 
         self._tab_widget.addTab(self._build_analysis_tab(), "Analysis")
         self._tab_widget.addTab(self._build_panel_config_tab(), "Panel Config")
+        self._tab_widget.addTab(self._build_zero_offset_tab(), "Irr Zero Offset")
         self._settings_tab_index = self._tab_widget.addTab(self._build_settings_tab(), "Settings")
         # Other controls (Sweep Timeout box, working folder, calibration
         # Choose…, the Settings dialog) also change settings, so the tab is
@@ -1128,7 +1135,10 @@ class LowLightApp(QMainWindow):
         self.lux_ts_ax.grid(True, alpha=0.3)
         self.lux_ts_ax.tick_params(labelsize=7)
 
-        self.irr_ts_ax.set_title("Irradiance (live)", fontsize=9)
+        offset = self._active_irr_offset()[0]
+        self.irr_ts_ax.set_title(
+            "Irradiance (live)" if offset is None else f"Irradiance (live, {offset:.4f} offset subtracted)", fontsize=9
+        )
         self.irr_ts_ax.set_xlabel("Seconds ago", fontsize=8)
         self.irr_ts_ax.set_ylabel("W/m²", fontsize=8)
         self.irr_ts_ax.grid(True, alpha=0.3)
@@ -1464,6 +1474,16 @@ class LowLightApp(QMainWindow):
             f"{result['skipped_bad_data']} skipped (missing/bad data)"
         )
 
+    def _active_irr_offset(self):
+        """(offset, label) subtracted from irradiance shown and logged now:
+        the lightbox round's dark offset during a round, otherwise this
+        session's zero offset, otherwise (None, "")."""
+        if self.lightbox_mode and self.lb_round is not None:
+            return self.lb_round.dark_offset, f"round dark offset, {self.lb_round.dark_offset_source}"
+        if self.irr_zero_offset is not None:
+            return self.irr_zero_offset, "zero offset"
+        return None, ""
+
     def _redraw_timeseries(self) -> None:
         now = time.time()
 
@@ -1480,7 +1500,9 @@ class LowLightApp(QMainWindow):
         if lux_times:
             self.lux_ts_ax.plot([t - now for t in lux_times], lux_values, color="#1a56db", linewidth=1.2)
         if irr_times:
-            self.irr_ts_ax.plot([t - now for t in irr_times], irr_values, color="#c53030", linewidth=1.2)
+            offset = self._active_irr_offset()[0] or 0.0
+            self.irr_ts_ax.plot([t - now for t in irr_times], [v - offset for v in irr_values],
+                                color="#c53030", linewidth=1.2)
 
         for ax in (self.lux_ts_ax, self.irr_ts_ax):
             for start, end in self._measurement_markers:
@@ -1641,6 +1663,160 @@ class LowLightApp(QMainWindow):
     # Settings tab: edit cache/settings.json in place
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Irr Zero Offset tab: capture the irradiance sensor's reading at zero
+    # irradiance (sensor covered) and keep it as the zero offset.
+    # ------------------------------------------------------------------
+
+    def _build_zero_offset_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        intro = QLabel(
+            "Cover the irradiance sensor completely (no light at all), wait for the reading to settle, "
+            "then Start Capture. Stop Capture once the running average has levelled off: the average "
+            "of every sample captured becomes the zero offset (the reading at 0 W/m²). For the rest of "
+            "this session it is subtracted from the live irradiance readout, the irradiance plot and "
+            "every saved test (irradiance_measured_live; the raw mean goes in irradiance_raw and the "
+            "offset in irr_dark_offset). It is not kept after the app closes. In lightbox mode it "
+            "also becomes the current round's dark offset. The plot below always shows raw readings."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#555; font-size:9pt;")
+        layout.addWidget(intro)
+
+        row = QHBoxLayout()
+        self.zo_start_btn = QPushButton("Start Capture")
+        self.zo_start_btn.setProperty("primary", True)
+        self.zo_start_btn.clicked.connect(self._guard(self._zero_offset_start))
+        self.zo_stop_btn = QPushButton("Stop Capture")
+        self.zo_stop_btn.setEnabled(False)
+        self.zo_stop_btn.clicked.connect(self._guard(self._zero_offset_stop))
+        self.zo_live_lbl = QLabel("Not capturing.")
+        self.zo_live_lbl.setStyleSheet("font-size:11pt; font-weight:bold;")
+        self.zo_clear_btn = QPushButton("Clear Offset")
+        self.zo_clear_btn.setToolTip("Stop subtracting a zero offset for the rest of this session")
+        self.zo_clear_btn.setEnabled(False)
+        self.zo_clear_btn.clicked.connect(self._guard(self._zero_offset_clear))
+        row.addWidget(self.zo_start_btn)
+        row.addWidget(self.zo_stop_btn)
+        row.addWidget(self.zo_clear_btn)
+        row.addSpacing(12)
+        row.addWidget(self.zo_live_lbl, 1)
+        layout.addLayout(row)
+
+        self.zo_current_lbl = QLabel("")
+        self.zo_current_lbl.setWordWrap(True)
+        self.zo_current_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.zo_current_lbl.setStyleSheet("font-size:10pt;")
+        layout.addWidget(self.zo_current_lbl)
+
+        fig = Figure(dpi=100, facecolor="#f0f2f5")
+        self.zo_canvas = FigureCanvas(fig)
+        self.zo_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.zo_ax = fig.add_subplot(111)
+        layout.addWidget(self.zo_canvas, 1)
+
+        self.zo_capture = zero_offset.ZeroOffsetCapture(self.irr_store.history)
+        self._zo_timer = QTimer(self)
+        self._zo_timer.setInterval(250)
+        self._zo_timer.timeout.connect(self._guard(self._zero_offset_tick))
+        self._zero_offset_refresh_current()
+        self._zero_offset_draw()
+        return tab
+
+    def _zero_offset_refresh_current(self) -> None:
+        value = self.irr_zero_offset
+        if value is None:
+            text = "Session zero offset: none. Irradiance is shown and logged uncorrected."
+        else:
+            text = (f"Session zero offset: <b>{value:.4f} W/m²</b> ({self.irr_zero_offset_info}), "
+                    "subtracted from irradiance until the app is closed.")
+        if self.lightbox_mode and self.lb_round is not None:
+            text += (f"<br>Lightbox round in progress: its dark offset "
+                     f"{self.lb_round.dark_offset:.4f} W/m² ({self.lb_round.dark_offset_source}) is what's applied.")
+        self.zo_current_lbl.setText(text)
+        self.zo_clear_btn.setEnabled(value is not None)
+
+    def _zero_offset_clear(self) -> None:
+        self.irr_zero_offset = None
+        self.irr_zero_offset_info = ""
+        self._zero_offset_refresh_current()
+        self._redraw_timeseries()
+        self.set_status("Irradiance zero offset cleared: irradiance is uncorrected for the rest of this session", "info")
+
+    def _zero_offset_start(self) -> None:
+        self.zo_capture.start()
+        self.zo_start_btn.setEnabled(False)
+        self.zo_stop_btn.setEnabled(True)
+        self.zo_live_lbl.setStyleSheet("font-size:11pt; font-weight:bold;")
+        self._zo_timer.start()
+        self._zero_offset_tick()
+
+    def _zero_offset_tick(self) -> None:
+        cap = self.zo_capture
+        cap.poll()
+        mean, sd = cap.mean(), cap.stdev()
+        parts = [f"{'Capturing' if cap.running else 'Captured'} {cap.elapsed():.0f} s", f"{cap.n} samples"]
+        if mean is not None:
+            parts.append(f"running average {mean:.4f} W/m²")
+        if sd is not None:
+            parts.append(f"std dev {sd:.4f}")
+        if cap.running and cap.n == 0 and cap.elapsed() > 5:
+            parts.append("no samples: is the irradiance sensor connected?")
+        self.zo_live_lbl.setText("   ·   ".join(parts))
+        self._zero_offset_draw()
+
+    def _zero_offset_stop(self) -> None:
+        cap = self.zo_capture
+        cap.stop()
+        self._zo_timer.stop()
+        self.zo_start_btn.setEnabled(True)
+        self.zo_stop_btn.setEnabled(False)
+        self._zero_offset_tick()
+        if cap.n < MIN_IRR_SAMPLES:
+            self.zo_live_lbl.setText(
+                f"Only {cap.n} sample(s) captured (minimum {MIN_IRR_SAMPLES}); zero offset not changed."
+            )
+            self.zo_live_lbl.setStyleSheet("font-size:11pt; font-weight:bold; color:#c53030;")
+            return
+        self.zo_live_lbl.setStyleSheet("font-size:11pt; font-weight:bold; color:#1b8a5a;")
+        mean = cap.mean()
+        self.irr_zero_offset = mean
+        self.irr_zero_offset_info = (f"captured {time.strftime('%H:%M:%S', time.localtime(cap.stopped_at))}, "
+                                     f"{cap.n} samples over {cap.elapsed():.0f} s")
+        msg = f"Irradiance zero offset {mean:.4f} W/m² ({cap.n} samples) is now subtracted from irradiance"
+        if self.lightbox_mode and self.lb_round is not None:
+            # A round subtracts its own dark offset; the new capture replaces it.
+            self.lb_round.dark_offset = mean
+            self.lb_round.dark_offset_source = "zero-offset tab"
+            self._lightbox_refresh_info()
+            msg += " (and is the current round's dark offset)"
+        self._zero_offset_refresh_current()
+        self._redraw_timeseries()
+        self.set_status(msg, "success")
+
+    def _zero_offset_draw(self) -> None:
+        cap, ax = self.zo_capture, self.zo_ax
+        ax.clear()
+        if cap.n:
+            t0 = cap.started_at
+            xs = [t - t0 for t in cap.times]
+            ax.plot(xs, cap.values, color="#1a56db", linewidth=1, marker=".", markersize=3, label="Irradiance")
+            ax.plot(xs, cap.running_mean(), color="#c53030", linewidth=2, label="Running average")
+            ax.legend(loc="upper right", fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "Start Capture with the irradiance sensor covered",
+                    ha="center", va="center", transform=ax.transAxes, color="#888")
+        ax.set_title("Irradiance zero-offset capture", fontsize=10)
+        ax.set_xlabel("Seconds since Start Capture", fontsize=9)
+        ax.set_ylabel("W/m²", fontsize=9)
+        ax.grid(True, alpha=0.3)
+        self.zo_canvas.figure.tight_layout()
+        self.zo_canvas.draw_idle()
+
     def _build_settings_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1733,6 +1909,7 @@ class LowLightApp(QMainWindow):
         self.settings_status_lbl.setStyleSheet("color:#444; font-size:9pt;")
 
     def _on_tab_changed(self, index: int) -> None:
+        self._zero_offset_refresh_current()
         if index == self._settings_tab_index and not self._settings_dirty:
             self._populate_settings_tab()
 
@@ -1905,6 +2082,7 @@ class LowLightApp(QMainWindow):
         "lux_stdev", "irradiance_stdev", "lux_3sigma_pct", "irradiance_3sigma_pct",
         "lightbox_setpoint_wm2", "panel_width_mm", "panel_height_mm", "vac_target", "vac_set",
         "irr_dark_offset", "irr_expected", "irr_deviation_pct", "lux_expected", "lux_deviation_pct",
+        "irradiance_raw",
     )
 
     def _load_session_from_folder(self, folder: Path) -> int:
@@ -2080,7 +2258,13 @@ class LowLightApp(QMainWindow):
         irr_value, irr_ts = self.irr_store.latest()
         irr_is_live = irr_value is not None and (irr_ts is None or now - irr_ts <= LIVE_STALE_S)
         if irr_is_live:
-            self.irr_value_lbl.setText(f"{irr_value:.4f} W/m²")
+            offset, label = self._active_irr_offset()
+            if offset is None:
+                self.irr_value_lbl.setText(f"{irr_value:.4f} W/m²")
+                self.irr_value_lbl.setToolTip("Raw sensor reading (no zero offset captured this session)")
+            else:
+                self.irr_value_lbl.setText(f"{irr_value - offset:.4f} W/m²")
+                self.irr_value_lbl.setToolTip(f"Raw {irr_value:.4f} minus {offset:.4f} ({label})")
             self.irr_badge.setText("● Irr: live")
             self.irr_badge.setStyleSheet("color:#a6ffcc; font-size:11pt; font-weight:bold; background:transparent;")
         else:
@@ -2707,6 +2891,9 @@ class LowLightApp(QMainWindow):
         # actually succeeds -- see _save_this_test().
         lux_value, _, _ = self.lux_live.snapshot()
         irr_value, irr_count = self.irr_store.average()
+        pending_offset = self._active_irr_offset()[0]
+        if irr_value is not None and pending_offset is not None:
+            irr_value -= pending_offset
         pending_snapshot = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "lux": lux_value if lux_value is not None else 0.0,
@@ -2840,7 +3027,10 @@ class LowLightApp(QMainWindow):
         )
         if not ok:
             return False
-        dlg = lbm.DarkOffsetDialog(self, self.irr_store.history, lbm.cr.IRR_ZERO_OFFSET_WM2, MIN_IRR_SAMPLES)
+        dlg = lbm.DarkOffsetDialog(
+            self, self.irr_store.history, lbm.cr.IRR_ZERO_OFFSET_WM2, MIN_IRR_SAMPLES,
+            stored_offset=(self.irr_zero_offset, self.irr_zero_offset_info) if self.irr_zero_offset is not None else None,
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return False
         if dlg.source == "measured":
@@ -3151,6 +3341,16 @@ class LowLightApp(QMainWindow):
 
         _lux_count, lux_mean, lux_stdev = self._windowed_stats(self.lux_history)
         lux_3sigma_pct = self._three_sigma_pct(lux_stdev, lux_mean)
+
+        # Logged irradiance has the active offset subtracted (the lightbox
+        # round's dark offset, else this session's zero offset); the raw mean
+        # is kept in irradiance_raw. The stdev is unaffected by the offset.
+        irr_raw = irr_mean
+        irr_offset, _ = self._active_irr_offset()
+        if self.lightbox_mode and self._last_lightbox_ctx is not None:
+            irr_offset = self._last_lightbox_ctx["dark_offset"]
+        if irr_mean is not None and irr_offset is not None:
+            irr_mean = irr_raw - irr_offset
         irr_3sigma_pct = self._three_sigma_pct(irr_stdev, irr_mean)
 
         snapshot = {
@@ -3163,8 +3363,12 @@ class LowLightApp(QMainWindow):
         lightbox_extra, deviation_warning = None, None
         if self.lightbox_mode and self._last_lightbox_ctx is not None:
             lightbox_extra, deviation_warning = self._lightbox_row_fields(
-                self._last_lightbox_ctx, irr_mean, lux_mean
+                self._last_lightbox_ctx, irr_raw, lux_mean
             )
+        row_extra = dict(lightbox_extra or {})
+        if irr_offset is not None:
+            row_extra["irr_dark_offset"] = round(float(irr_offset), 6)
+            row_extra["irradiance_raw"] = irr_raw if irr_raw is not None else ""
 
         try:
             summary_csv = self.settings["summary_csv"]
@@ -3189,7 +3393,7 @@ class LowLightApp(QMainWindow):
             irradiance_stdev=irr_stdev if irr_stdev is not None else "",
             lux_3sigma_pct=lux_3sigma_pct if lux_3sigma_pct is not None else "",
             irradiance_3sigma_pct=irr_3sigma_pct if irr_3sigma_pct is not None else "",
-            extra=lightbox_extra,
+            extra=row_extra,
         )
 
         try:
