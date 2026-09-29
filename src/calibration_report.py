@@ -15,7 +15,7 @@ Everything is recomputed from the selected folder, so a new campaign needs no
 code change.
 
 Decisions (see the campaign notes.md):
-  * Irradiance zero offset of 0.23 W/m2 is subtracted from every irr reading.
+  * Irradiance zero offset of 0.22 W/m2 is subtracted from every irr reading.
   * Values are NOT drift-corrected. Each pass's reference drift
     (ref_end - ref_start) / ref_start is reported as an uncertainty.
   * No curve fitting. Panel averages come straight from the measured map:
@@ -23,7 +23,12 @@ Decisions (see the campaign notes.md):
     panel rectangle on a 5 mm grid. Only measured VAC levels are available.
   * Single-node glitches (value more than 50 % away from the median of its
     neighbours, or <= 0 after the offset) are flagged and left out of the max.
-    For panel averages only, a glitch node is replaced by that neighbour median.
+  * Blocks of bad nodes the glitch rule cannot see (e.g. a shadow) are listed
+    in the campaign's optional exclusions.csv (vac, quantity, nodes, reason)
+    and treated like glitches.
+  * For panel averages and sensor predictions only, a glitch or excluded node
+    is filled from the adjacent levels' pattern at that node, scaled to this
+    pass; the neighbour median is the fallback.
 
 Usage:
   python src/calibration_report.py calibration/cal-20260917-113349-lightbox
@@ -44,7 +49,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import calibration_model as cm  # noqa: E402
 
-IRR_ZERO_OFFSET_WM2 = 0.23
+IRR_ZERO_OFFSET_WM2 = 0.22  # sensor reads 0.22 W/m2 in the dark (AK, 2026-09-29)
 OUTLIER_FRAC = 0.5
 PANEL_INTEGRATION_STEP_MM = 5.0
 CONTOUR_LEVELS_PCT = [50, 60, 70, 80, 90, 95]
@@ -52,6 +57,8 @@ QUANTITIES = ("lux", "irr")
 UNITS = {"lux": "lx", "irr": "W/m2"}
 STANDARD_PANELS_MM = [(100, 100), (150, 150), (200, 150), (250, 200), (300, 200), (400, 300), (500, 300)]
 REPORT_SUBDIR = "report"
+EXCLUSIONS_FILE = "exclusions.csv"
+VAC_MATCH_TOL = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -59,14 +66,43 @@ REPORT_SUBDIR = "report"
 # ---------------------------------------------------------------------------
 
 
+def load_exclusions(folder, grid) -> list[dict]:
+    """Read the campaign's optional exclusions.csv: one row per pass with
+    columns vac, quantity (lux/irr), nodes (space or comma separated) and
+    reason. Returns [{"vac", "quantity", "nodes": [labels], "reason"}]."""
+    import csv
+
+    path = Path(folder) / EXCLUSIONS_FILE
+    if not path.exists():
+        return []
+    out = []
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        for i, row in enumerate(csv.DictReader(fh), start=2):
+            vac_txt = (row.get("vac") or "").strip()
+            if not vac_txt or vac_txt.startswith("#"):
+                continue
+            q = (row.get("quantity") or "").strip().lower()
+            if q not in QUANTITIES:
+                raise ValueError(f"{path.name} line {i}: quantity must be lux or irr, got {q!r}")
+            nodes = [n.strip().upper() for n in (row.get("nodes") or "").replace(",", " ").split() if n.strip()]
+            for n in nodes:
+                c, r = cm.parse_node_label(n)
+                if not (0 <= c < grid.cols and 0 <= r < grid.rows):
+                    raise ValueError(f"{path.name} line {i}: node {n} is outside the grid")
+            out.append({"vac": float(vac_txt), "quantity": q, "nodes": nodes, "reason": (row.get("reason") or "").strip()})
+    return out
+
+
 def load_passes(folder, irr_offset: float = IRR_ZERO_OFFSET_WM2):
     """Return (config, grid, passes). passes[(level_index, quantity)] holds the
-    raw node matrix (rows x cols, offset applied for irr), 3-sigma %, refs and
-    drift. Passes missing a start or end reference are skipped."""
+    raw node matrix (rows x cols, offset applied for irr), 3-sigma %, refs,
+    drift and the mask of nodes listed in exclusions.csv. Passes missing a
+    start or end reference are skipped."""
     folder = Path(folder)
     config = cm.load_campaign_config(folder)
     grid = cm.grid_from_campaign(config)
     caps = cm.active_captures(cm.read_captures(cm.captures_csv_path(folder)))
+    exclusions = load_exclusions(folder, grid)
 
     groups: dict[tuple[int, str], list[dict]] = {}
     for c in caps:
@@ -88,10 +124,18 @@ def load_passes(folder, irr_offset: float = IRR_ZERO_OFFSET_WM2):
             tsig[r["row_index"], r["col_index"]] = r["three_sigma_pct"] if r["three_sigma_pct"] is not None else np.nan
         rs = ref_s[-1]["mean"] - offset
         re_ = ref_e[-1]["mean"] - offset
+        vac = float(rows[0]["variac_vac"])
+        excluded = np.zeros((grid.rows, grid.cols), dtype=bool)
+        for ex in exclusions:
+            if ex["quantity"] == q and abs(ex["vac"] - vac) <= VAC_MATCH_TOL:
+                for n in ex["nodes"]:
+                    c, r = cm.parse_node_label(n)
+                    excluded[r, c] = True
         passes[(level, q)] = {
             "level": level,
             "quantity": q,
-            "vac": float(rows[0]["variac_vac"]),
+            "vac": vac,
+            "excluded": excluded,
             "values": vals,
             "three_sigma": tsig,
             "ref_start": rs,
@@ -100,6 +144,66 @@ def load_passes(folder, irr_offset: float = IRR_ZERO_OFFSET_WM2):
             "missing_nodes": int(np.isnan(vals).sum()),
         }
     return config, grid, passes
+
+
+def load_calibration(folder, irr_offset: float = IRR_ZERO_OFFSET_WM2, outlier_frac: float = OUTLIER_FRAC):
+    """Everything the maths needs, without the report's plots: (config, grid,
+    passes) with "outliers" (glitch or excluded) and "filled" attached, kept
+    to the levels that have both a lux and an irr pass. Raises ValueError if
+    no level qualifies."""
+    config, grid, passes = load_passes(folder, irr_offset)
+    levels = {l for (l, q) in passes if (l, "lux") in passes and (l, "irr") in passes}
+    if not levels:
+        raise ValueError("No level in this campaign has both a complete lux and irr pass.")
+    passes = {k: v for k, v in passes.items() if k[0] in levels}
+    for p in passes.values():
+        # Excluded nodes are hidden from the glitch check so they don't make
+        # their good neighbours look like glitches.
+        flag_vals = np.where(p["excluded"], np.nan, p["values"])
+        glitch, p["neighbour_median"] = flag_outliers(flag_vals, outlier_frac)
+        p["glitch"] = glitch
+        p["outliers"] = glitch | p["excluded"]
+    fill_from_levels(passes)
+    return config, grid, passes
+
+
+def fill_from_levels(passes) -> None:
+    """Attach p["filled"]: the measured map with glitch/excluded/missing nodes
+    replaced. A bad node takes its value from the nearest measured level
+    below and above (same quantity) where that node is good, each scaled to
+    this pass by the median ratio this/that over the nodes good in both, then
+    combined as a geometric mean. With no usable adjacent level it falls back
+    to the median of its good neighbours (filled_map)."""
+    def good_mask(p):
+        return ~p["outliers"] & np.isfinite(p["values"]) & (p["values"] > 0)
+
+    for q in QUANTITIES:
+        seq = sorted((p for (l, qq), p in passes.items() if qq == q), key=lambda p: p["vac"])
+        for i, p in enumerate(seq):
+            out = filled_map(p["values"], p["outliers"])
+            good = good_mask(p)
+            bad = ~good
+            if bad.any():
+                logs = []
+                for j in (i - 1, i + 1):
+                    if not 0 <= j < len(seq):
+                        continue
+                    o = seq[j]
+                    o_good = good_mask(o)
+                    both = good & o_good
+                    if both.sum() < 5:
+                        continue
+                    scale = float(np.median(p["values"][both] / o["values"][both]))
+                    est = np.full(p["values"].shape, np.nan)
+                    est[o_good] = np.log(o["values"][o_good] * scale)
+                    logs.append(est)
+                if logs:
+                    stack = np.stack(logs)
+                    n_ok = np.isfinite(stack).sum(axis=0)
+                    geo = np.exp(np.nansum(stack, axis=0) / np.maximum(n_ok, 1))
+                    use = bad & (n_ok > 0)
+                    out[use] = geo[use]
+            p["filled"] = out
 
 
 def flag_outliers(vals: np.ndarray, frac: float = OUTLIER_FRAC):
@@ -195,7 +299,7 @@ def _loglog(x0, y0, x1, y1, y):
     return math.exp(math.log(x0) + (math.log(y) - math.log(y0)) * (math.log(x1) - math.log(x0)) / (math.log(y1) - math.log(y0)))
 
 
-def vac_for_target(passes, grid, w_mm, l_mm, target, quantity="irr"):
+def vac_for_target(passes, grid, w_mm, l_mm, target, quantity="irr", sensor_nodes=None):
     """VAC that gives a panel-average `target` over a w x l panel centred on F4.
 
     Uses only measured data: the panel average at every measured level (same
@@ -203,7 +307,11 @@ def vac_for_target(passes, grid, w_mm, l_mm, target, quantity="irr"):
     interpolation between the two levels that bracket the target. Raises
     ValueError outside the measured range. Returns a dict with the VAC, its
     uncertainty from drift, the bracketing levels, the local exponent n and the
-    expected panel average of the other quantity at that VAC."""
+    expected panel average of the other quantity at that VAC.
+
+    sensor_nodes, e.g. {"irr": "B6", "lux": "J6"}, adds the reading each sensor
+    should show at that VAC: the node's own measured values at the two
+    bracketing levels joined by value ~ VAC^n (n from that node's two points)."""
     check_panel(grid, w_mm, l_mm)
     if target <= 0:
         raise ValueError("target must be > 0")
@@ -218,19 +326,74 @@ def vac_for_target(passes, grid, w_mm, l_mm, target, quantity="irr"):
     if any(b <= a for a, b in zip(avgs, avgs[1:])):
         raise ValueError("panel average does not rise steadily with VAC for this panel size; check the data before inverting")
     if not (avgs[0] <= target <= avgs[-1]):
+        if target < avgs[0]:
+            hint = (f" Lowest reachable for this size: {avgs[0]:.4g} {UNITS[quantity]} at {pts[0][0]:g} VAC. "
+                    "Add lower calibration levels to go below that.")
+        else:
+            hint = f" Highest reachable for this size: {avgs[-1]:.4g} {UNITS[quantity]} at {pts[-1][0]:g} VAC."
         raise ValueError(f"target {target:g} {UNITS[quantity]} is outside the measured range for a {w_mm:g} x {l_mm:g} mm panel "
-                         f"({avgs[0]:.4g} to {avgs[-1]:.4g} {UNITS[quantity]}, {pts[0][0]:g} to {pts[-1][0]:g} VAC).")
+                         f"({avgs[0]:.4g} to {avgs[-1]:.4g} {UNITS[quantity]}, {pts[0][0]:g} to {pts[-1][0]:g} VAC).{hint}")
     i = next(k for k in range(len(pts) - 1) if pts[k][1] <= target <= pts[k + 1][1])
     lo, hi = pts[i], pts[i + 1]
     vac = _loglog(lo[0], lo[1], hi[0], hi[1], target)
     n = math.log(hi[1] / lo[1]) / math.log(hi[0] / lo[0])
     drift = max(lo[2], hi[2])
     other_avg = math.exp(math.log(lo[3]) + (math.log(vac) - math.log(lo[0])) * (math.log(hi[3]) - math.log(lo[3])) / (math.log(hi[0]) - math.log(lo[0])))
+    sensors = {}
+    if sensor_nodes:
+        exp = expected_at_vac(passes, grid, vac, sensor_nodes)
+        for q, sn in exp["nodes"].items():
+            panel = target if q == quantity else other_avg
+            sensors[q] = {**sn, "panel_over_sensor": panel / sn["value"]}
     return {
+        "sensors": sensors,
         "vac": vac, "vac_unc_pct": drift / n, "vac_unc_v": vac * drift / n / 100.0, "drift_pct": drift, "n": n,
         "bracket": [{"vac": lo[0], "avg": lo[1], "level": lo[4]}, {"vac": hi[0], "avg": hi[1], "level": hi[4]}],
         f"{other}_avg": other_avg,
     }
+
+
+def expected_at_vac(passes, grid, vac, nodes, w_mm=None, l_mm=None):
+    """What the calibration predicts at an arbitrary VAC.
+
+    nodes, e.g. {"irr": "B6", "lux": "J6"}: for each quantity, the node's own
+    filled values at the measured levels just below and above `vac`, joined by
+    value ~ VAC^n (n from those two points; exact at a measured level). With a
+    panel size, the panel averages of both quantities come back too, by the
+    same rule. Raises ValueError outside the measured VAC range or when a
+    value needed is <= 0."""
+    levels = sorted({l for (l, q) in passes}, key=lambda l: passes[(l, "irr")]["vac"])
+    vacs = [passes[(l, "irr")]["vac"] for l in levels]
+    if not (vacs[0] - 1e-9 <= vac <= vacs[-1] + 1e-9):
+        raise ValueError(f"{vac:g} VAC is outside the calibrated range ({vacs[0]:g} to {vacs[-1]:g} VAC).")
+    i = min(max(k for k in range(len(vacs)) if vacs[k] <= vac + 1e-9), len(vacs) - 2)
+    la, lb = levels[i], levels[i + 1]
+    va_, vb_ = vacs[i], vacs[i + 1]
+
+    def interp(ya, yb, what):
+        if not (ya > 0 and yb > 0):
+            raise ValueError(f"cannot interpolate {what}: calibration value <= 0 at {va_:g} or {vb_:g} VAC")
+        nq = math.log(yb / ya) / math.log(vb_ / va_)
+        return ya * (vac / va_) ** nq, nq
+
+    out = {"vac": vac, "bracket": [{"vac": va_, "level": la}, {"vac": vb_, "level": lb}], "nodes": {}}
+    for q, node in (nodes or {}).items():
+        c, r = cm.parse_node_label(node)
+        if not (0 <= c < grid.cols and 0 <= r < grid.rows):
+            raise ValueError(f"node {node} is outside the {cm.node_label(0, 0)}-{cm.node_label(grid.cols - 1, grid.rows - 1)} grid")
+        pa, pb = passes[(la, q)], passes[(lb, q)]
+        v, nq = interp(float(pa["filled"][r, c]), float(pb["filled"][r, c]), f"{q} at {node}")
+        out["nodes"][q] = {
+            "node": node.upper(), "value": v, "n": nq,
+            "drift_pct": max(abs(pa["drift_pct"]), abs(pb["drift_pct"])),
+            "glitch": bool(pa["outliers"][r, c] or pb["outliers"][r, c]),
+        }
+    if w_mm is not None and l_mm is not None:
+        for q in QUANTITIES:
+            ya = panel_average(passes[(la, q)]["filled"], grid, w_mm, l_mm)
+            yb = panel_average(passes[(lb, q)]["filled"], grid, w_mm, l_mm)
+            out[f"{q}_panel_avg"] = interp(ya, yb, f"{q} panel average")[0]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -274,15 +437,12 @@ def _mat(m, nd=4):
 
 def build_report(folder, irr_offset=IRR_ZERO_OFFSET_WM2, outlier_frac=OUTLIER_FRAC):
     folder = Path(folder)
-    config, grid, passes = load_passes(folder, irr_offset)
-    for p in passes.values():
-        p["outliers"], p["neighbour_median"] = flag_outliers(p["values"], outlier_frac)
-        p["filled"] = filled_map(p["values"], p["outliers"])
-
-    levels = sorted({l for (l, q) in passes if (l, "lux") in passes and (l, "irr") in passes})
-    if not levels:
-        raise SystemExit("No level in this campaign has both a complete lux and irr pass.")
-    passes = {k: v for k, v in passes.items() if k[0] in levels}
+    try:
+        config, grid, passes = load_calibration(folder, irr_offset, outlier_frac)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    exclusions = load_exclusions(folder, grid)
+    levels = sorted({l for (l, q) in passes})
     vac_by_level = {l: passes[(l, "lux")]["vac"] for l in levels}
     labels = [[cm.node_label(c, r) for c in range(grid.cols)] for r in range(grid.rows)]
     x_c, y_c = grid_centre(grid)
@@ -309,6 +469,7 @@ def build_report(folder, irr_offset=IRR_ZERO_OFFSET_WM2, outlier_frac=OUTLIER_FR
                 "values": _mat(vals), "filled": _mat(p["filled"]), "pct": _mat(pct, 2),
                 "gray": [[None if not np.isfinite(g) else int(g) for g in row] for row in gray],
                 "outliers": [labels[r][c] for r, c in np.argwhere(mask)],
+                "excluded": [labels[r][c] for r, c in np.argwhere(p["excluded"])],
                 "contours": contour_segments(np.where(mask | ~np.isfinite(pct), np.nan, pct)),
             }
         level_out.append(entry)
@@ -340,8 +501,11 @@ def build_report(folder, irr_offset=IRR_ZERO_OFFSET_WM2, outlier_frac=OUTLIER_FR
         "settings": {
             "irr_zero_offset_wm2": irr_offset, "drift_corrected": False, "curve_fit": False,
             "panel_average": f"bilinear between nodes, averaged on a {PANEL_INTEGRATION_STEP_MM:g} mm grid",
-            "outlier_rule": f"|value - median(neighbours)| / median > {outlier_frac:g}, or value <= 0 after offset",
+            "outlier_rule": f"|value - median(neighbours)| / median > {outlier_frac:g}, or value <= 0 after offset"
+                            + "".join(f"; excluded ({e['reason'] or 'listed in ' + EXCLUSIONS_FILE}): {e['vac']:g} VAC {e['quantity']} {' '.join(e['nodes'])}" for e in exclusions),
             "contour_levels_pct": CONTOUR_LEVELS_PCT,
+            "exclusions": exclusions,
+            "fill_rule": "glitch/excluded nodes filled from the adjacent levels' pattern at that node, scaled to the pass; neighbour median as fallback",
         },
         "col_labels": [cm.col_letter(i) for i in range(grid.cols)],
         "levels": level_out,
@@ -428,7 +592,7 @@ def write_workbook(report, path: Path):
         f"Campaign: {report['campaign']['campaign_id']}", f"Generated: {report['generated_at']}",
         f"Irradiance zero offset subtracted: {s['irr_zero_offset_wm2']} W/m2", "Drift correction: none (drift reported as uncertainty)",
         "Curve fitting: none. Panel averages use the measured map only.",
-        f"Panel average: {s['panel_average']}. Glitch nodes replaced by their neighbour median for this only.",
+        f"Panel average: {s['panel_average']}. Glitch and excluded nodes are filled for this only: {s['fill_rule']}.",
         f"Outlier rule: {s['outlier_rule']}",
         "x runs A to K, y runs row 1 to row 7, origin A1, F4 = centre. Panel w is along x, l along y.",
     ]:
@@ -505,6 +669,8 @@ def main(argv=None):
     ap.add_argument("--vac", type=float, help="query: a measured variac level, VAC")
     ap.add_argument("--panel", help="query: panel size WxL in mm, e.g. 200x150 (W along A-K, L along rows)")
     ap.add_argument("--target-irr", type=float, help="query: required panel-average irradiance, W/m2 (needs --panel); prints the VAC")
+    ap.add_argument("--irr-node", help="with --target-irr: irradiance sensor grid node, e.g. B6")
+    ap.add_argument("--lux-node", help="with --target-irr: lux sensor grid node, e.g. J6")
     ap.add_argument("--irr-offset", type=float, default=IRR_ZERO_OFFSET_WM2)
     ap.add_argument("--no-png", action="store_true")
     ap.add_argument("--no-xlsx", action="store_true")
@@ -517,7 +683,8 @@ def main(argv=None):
             ap.error("--target-irr needs --panel")
         w, l = (float(v) for v in args.panel.lower().split("x"))
         try:
-            r = vac_for_target(passes, grid, w, l, args.target_irr, "irr")
+            nodes = {q: n.upper() for q, n in (("irr", args.irr_node), ("lux", args.lux_node)) if n}
+            r = vac_for_target(passes, grid, w, l, args.target_irr, "irr", nodes)
         except ValueError as exc:
             print(exc)
             return 2
@@ -526,6 +693,10 @@ def main(argv=None):
               f"(drift {r['drift_pct']:.1f}% / n {r['n']:.2f})")
         print(f"  between measured {b0['vac']:g} VAC ({b0['avg']:.4g} W/m2) and {b1['vac']:g} VAC ({b1['avg']:.4g} W/m2); "
               f"expected avg lux {r['lux_avg']:.4g} lx")
+        for q, sn in r["sensors"].items():
+            raw = f", raw display ~{sn['value'] + args.irr_offset:.4g}" if q == "irr" else ""
+            print(f"  {q} sensor at {sn['node']} should read {sn['value']:.4g} {UNITS[q]} +/- {sn['drift_pct']:.1f}%{raw}; "
+                  f"panel / sensor = {sn['panel_over_sensor']:.3f}" + ("  (glitch or excluded node, filled value used)" if sn["glitch"] else ""))
         return 0
 
     if args.vac is not None or args.panel:

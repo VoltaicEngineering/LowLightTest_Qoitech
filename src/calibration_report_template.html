@@ -182,7 +182,7 @@ footer { padding-block: 32px 0; color: var(--ink-3); font-size: 12px; }
 <header class="hero">
   <div class="eyebrow" id="h-eyebrow"></div>
   <h1>Halogen lightbox: light field across the test plane, 19 to 124 VAC</h1>
-  <p class="muted">Built from the 77-node map (A1 to K7, 50 mm pitch, F4 at the geometric centre) measured at every variac level. Irradiance has the 0.23 W/m² zero offset removed. Nothing is drift-corrected: each pass's reference drift is carried as an uncertainty instead. There is no curve fitting: every number comes from the measured nodes.</p>
+  <p class="muted">Built from the 77-node map (A1 to K7, 50 mm pitch, F4 at the geometric centre) measured at every variac level. Irradiance has the <span id="h-offset"></span> W/m² sensor zero offset subtracted from every reading. Nothing is drift-corrected: each pass's reference drift is carried as an uncertainty instead. There is no curve fitting: every number comes from the measured nodes.</p>
   <div class="chips" id="chips"></div>
 </header>
 
@@ -243,7 +243,7 @@ footer { padding-block: 32px 0; color: var(--ink-3); font-size: 12px; }
   </div>
   <div class="grid2">
     <div class="panel" style="display:grid; gap:14px">
-      <h3>VAC for a required irradiance</h3>
+      <h3>5.1 VAC for a required irradiance</h3>
       <div class="controls">
         <label class="field" for="t-irr">Target avg, W/m²<input id="t-irr" type="number" step="1" min="0" value="100"></label>
         <label class="field" for="t-w">Width w, mm<input id="t-w" type="number" step="10" min="10" max="500" value="200"></label>
@@ -258,6 +258,23 @@ footer { padding-block: 32px 0; color: var(--ink-3); font-size: 12px; }
     </div>
     <div class="panel"><div class="chart-title"><h3>Panel avg irradiance vs VAC</h3><span class="legend"><span style="color:var(--irr)"><i class="dot"></i>measured levels</span><span style="color:var(--lux)"><i class="dot"></i>target</span></span></div><div id="c-inv"></div>
       <p class="caption">Log-log axes: each straight segment between two dots is exactly the interpolation used.</p></div>
+  </div>
+  <div class="panel" style="display:grid; gap:14px">
+    <div class="chart-title"><h3>5.1 Sensor readings to expect at that VAC</h3><span class="small muted">off-centre sensor positions during the IV run</span></div>
+    <div class="grid2">
+      <div style="display:grid; gap:14px; align-content:start">
+        <div class="controls">
+          <label class="field" for="s-irr">Irradiance sensor node<select id="s-irr"></select></label>
+          <label class="field" for="s-lux">Lux sensor node<select id="s-lux"></select></label>
+        </div>
+        <div class="grid2" style="gap:10px">
+          <div class="result"><span class="eyebrow">Irr sensor should read</span><span class="big" id="s-irr-v"></span><span class="pm" id="s-irr-u"></span><span class="small muted" id="s-irr-b"></span></div>
+          <div class="result"><span class="eyebrow">Lux sensor should read</span><span class="big" id="s-lux-v"></span><span class="pm" id="s-lux-u"></span><span class="small muted" id="s-lux-b"></span></div>
+        </div>
+        <p class="caption">Each node is interpolated on its own: its measured value at the two bracketing levels, joined by value ∝ VAC^n (n from that node's two points), evaluated at the calculated VAC. ± is the larger drift of that quantity's two passes. The ratio panel ÷ sensor is the factor to multiply a sensor reading by to get the panel average at this VAC. Irradiance values have the zero offset removed; add it back to compare with the raw sensor display.</p>
+      </div>
+      <div><div id="s-grid"></div></div>
+    </div>
   </div>
   <div class="panel" style="display:grid; gap:10px">
     <div class="controls"><label class="field" for="std-size">Standard size check at measured levels<select id="std-size"></select></label></div>
@@ -383,6 +400,7 @@ const chips = [
   ["Curve fit", "none, measured nodes only"],
   ["Dwell", `${camp.dwell_seconds} s per node`],
 ];
+document.getElementById("h-offset").textContent = D.settings.irr_zero_offset_wm2;
 document.getElementById("chips").innerHTML = chips.map(([k, v]) => `<span class="chip">${k}: <b>${v}</b></span>`).join("");
 
 // ---------- findings (computed from data)
@@ -538,8 +556,8 @@ function panelAvg(m, w, l) {
   for (let i = 0; i < nx; i++) for (let j = 0; j < ny; j++) s += bilinear(m, xc - w / 2 + (i + 0.5) * w / nx, yc - l / 2 + (j + 0.5) * l / ny);
   return s / (nx * ny);
 }
-function footprint(w, l) {
-  const host = document.getElementById("footprint");
+function footprint(w, l, hostId, sensors) {
+  const host = document.getElementById(hostId || "footprint");
   const s = 0.9, ml = 26, mt = 22, W = ml + (C - 1) * pitch * s + 30, H = mt + (R - 1) * pitch * s + 30;
   host.innerHTML = "";
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}` }, host);
@@ -555,6 +573,11 @@ function footprint(w, l) {
   }
   for (let c = 0; c < C; c++) { const t = el("text", { x: X(c * pitch), y: 14, "text-anchor": "middle", "font-size": 11 }, svg); t.textContent = cols[c]; }
   for (let r = 0; r < R; r++) { const t = el("text", { x: 12, y: Y(r * pitch) + 4, "text-anchor": "middle", "font-size": 11 }, svg); t.textContent = r + 1; }
+  for (const sn of sensors || []) {
+    const c = cols.indexOf(sn.node[0]), r = +sn.node.slice(1) - 1;
+    el("circle", { cx: X(c * pitch) + sn.dx, cy: Y(r * pitch), r: 9, fill: "none", stroke: sn.color, "stroke-width": 3 }, svg);
+    const tl = el("text", { x: X(c * pitch) + sn.dx, y: Y(r * pitch) - 13, "text-anchor": "middle", "font-size": 10, "font-weight": 600, style: `fill:${sn.color}` }, svg); tl.textContent = sn.label;
+  }
   const t = el("text", { x: W - 4, y: H - 4, "text-anchor": "end", "font-size": 11 }, svg); t.textContent = `${n} node${n === 1 ? "" : "s"} under the panel`;
 }
 function calc() {
@@ -616,6 +639,28 @@ function invChart(pts, res, target) {
     t.textContent = `${res.vac.toFixed(1)} VAC`;
   }
 }
+const nodeLabels = []; for (let r = 0; r < R; r++) for (let c = 0; c < C; c++) nodeLabels.push(cols[c] + (r + 1));
+for (const [id, def] of [["s-irr", "B6"], ["s-lux", "J6"]]) document.getElementById(id).innerHTML = nodeLabels.map(n => `<option ${n === def ? "selected" : ""}>${n}</option>`).join("");
+const byVac = {}; for (const e of D.levels) byVac[e.vac] = e;
+function nodeAt(e, q, node) { const c = cols.indexOf(node[0]), r = +node.slice(1) - 1; return e[q].filled[r][c]; }
+function sensorCalc(res, w, l) {
+  const ids = ["s-irr-v", "s-irr-u", "s-irr-b", "s-lux-v", "s-lux-u", "s-lux-b"];
+  const nodes = { irr: document.getElementById("s-irr").value, lux: document.getElementById("s-lux").value };
+  const marks = [{ node: nodes.irr, color: css("--irr"), label: "irr", dx: nodes.irr === nodes.lux ? -4 : 0 }, { node: nodes.lux, color: css("--lux"), label: "lux", dx: nodes.irr === nodes.lux ? 4 : 0 }];
+  if (w > 0 && l > 0) footprint(Math.min(w, 2 * D.campaign.x_c), Math.min(l, 2 * D.campaign.y_c), "s-grid", marks);
+  if (!res) { for (const id of ids) document.getElementById(id).textContent = ""; document.getElementById("s-irr-v").textContent = "–"; document.getElementById("s-lux-v").textContent = "–"; return; }
+  const [a, b] = res.bracket, ea = byVac[a.vac], eb = byVac[b.vac];
+  for (const q of ["irr", "lux"]) {
+    const node = nodes[q], va = nodeAt(ea, q, node), vb = nodeAt(eb, q, node);
+    const nq = Math.log(vb / va) / Math.log(b.vac / a.vac), v = va * Math.pow(res.vac / a.vac, nq);
+    const drift = Math.max(Math.abs(ea[q].drift_pct), Math.abs(eb[q].drift_pct));
+    const panel = q === "irr" ? res.target : res.lux;
+    const glitch = ea[q].outliers.includes(node) || eb[q].outliers.includes(node);
+    document.getElementById(`s-${q}-v`).innerHTML = `${fmt(v)} <small>${UNIT[q]}</small>`;
+    document.getElementById(`s-${q}-u`).textContent = `± ${drift.toFixed(1)} %  (± ${fmt(v * drift / 100, 3)} ${UNIT[q]})`;
+    document.getElementById(`s-${q}-b`).textContent = `at ${node}: ${fmt(va)} at ${a.vac} VAC, ${fmt(vb)} at ${b.vac} VAC, n = ${nq.toFixed(2)} · panel ÷ sensor = ${(panel / v).toFixed(3)}` + (q === "irr" ? ` · raw display ≈ ${fmt(v + D.settings.irr_zero_offset_wm2)}` : "") + (glitch ? " · this node was a glitch or excluded at one of these levels, filled value used" : "");
+  }
+}
 function invCalc() {
   const target = parseFloat(document.getElementById("t-irr").value), w = parseFloat(document.getElementById("t-w").value), l = parseFloat(document.getElementById("t-l").value);
   const errEl = document.getElementById("t-err");
@@ -623,7 +668,7 @@ function invCalc() {
   let msg = "";
   if (!(w > 0 && w <= 2 * D.campaign.x_c && l > 0 && l <= 2 * D.campaign.y_c)) msg = `Panel must be at most ${2 * D.campaign.x_c} × ${2 * D.campaign.y_c} mm, the measured extent.`;
   else if (!(target > 0)) msg = "Enter a target irradiance above 0 W/m².";
-  if (msg) { errEl.hidden = false; errEl.textContent = msg; clear(); document.getElementById("c-inv").innerHTML = ""; return; }
+  if (msg) { errEl.hidden = false; errEl.textContent = msg; clear(); document.getElementById("c-inv").innerHTML = ""; sensorCalc(null, w, l); return; }
   const pts = levelAvgs(w, l);
   let res = null;
   if (pts.some((p, i) => i && p.irr <= pts[i - 1].irr)) msg = "The panel average does not rise steadily with VAC for this size, so it cannot be inverted. Check the data.";
@@ -636,7 +681,7 @@ function invCalc() {
     const nl = Math.log(b.lux / a.lux) / Math.log(b.vac / a.vac);
     const lux = a.lux * Math.pow(vac / a.vac, nl);
     const drift = Math.max(a.drift, b.drift), uPct = drift / n;
-    res = { vac, n, bracket: [a, b] };
+    res = { vac, n, bracket: [a, b], target, lux };
     document.getElementById("t-vac").innerHTML = `${vac.toFixed(1)} <small>VAC</small>`;
     document.getElementById("t-vac-u").textContent = `± ${(vac * uPct / 100).toFixed(2)} V  (± ${uPct.toFixed(1)} %)`;
     document.getElementById("t-vac-b").textContent = `between ${a.vac} VAC (${fmt(a.irr)} W/m²) and ${b.vac} VAC (${fmt(b.irr)} W/m²), n = ${n.toFixed(2)}, drift ${drift.toFixed(1)} %`;
@@ -646,8 +691,9 @@ function invCalc() {
   errEl.hidden = !msg; errEl.textContent = msg;
   if (msg) clear();
   invChart(pts, res, target);
+  sensorCalc(msg ? null : res, w, l);
 }
-for (const id of ["t-irr", "t-w", "t-l"]) document.getElementById(id).addEventListener("input", invCalc);
+for (const id of ["t-irr", "t-w", "t-l", "s-irr", "s-lux"]) document.getElementById(id).addEventListener("input", invCalc);
 invCalc();
 
 // ---------- quality
@@ -658,7 +704,7 @@ document.getElementById("t-drift").innerHTML =
     const o = [...e.lux.outliers.map(n => n + " lux"), ...e.irr.outliers.map(n => n + " irr")].join(", ") || "–";
     return `<tr><td>L${e.level}</td><td class="num">${e.vac}</td><td class="num">${pct(e.lux.drift_pct)}</td><td>${st("lux")}</td><td class="num">${pct(e.irr.drift_pct)}</td><td>${st("irr")}</td><td class="num">${e.lux.median_three_sigma_pct.toFixed(2)}%</td><td class="num">${e.irr.median_three_sigma_pct.toFixed(2)}%</td><td>${o}</td></tr>`;
   }).join("") + "</tbody>";
-document.getElementById("rule").textContent = `Glitch rule: ${D.settings.outlier_rule}. Glitch nodes are shown on the maps and left out of the maximum. For panel averages they are replaced by their neighbour median.`;
+document.getElementById("rule").textContent = `Glitch rule: ${D.settings.outlier_rule}. Glitch nodes are shown on the maps and left out of the maximum. For panel averages and sensor predictions they are filled: ${D.settings.fill_rule}.`;
 document.getElementById("foot").textContent = `Source: ${camp.folder}/captures.csv · generated ${D.generated_at} by src/calibration_report.py`;
 
 // redraw on theme change so SVG colours follow tokens
