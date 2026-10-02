@@ -1669,7 +1669,15 @@ class LightboxCalibrationApp(QMainWindow):
             sc, sr = cm.parse_node_label(sensor_node)
             self.analysis_ax.plot(sc, sr, marker="*", color="red", markersize=14)
 
-        self.analysis_canvas.figure.colorbar(im, ax=self.analysis_ax, shrink=0.8)
+        # Replace, not add: every redraw used to leave the previous colorbar
+        # behind, so they piled up beside the heatmap.
+        old_cbar = getattr(self, "_analysis_colorbar", None)
+        if old_cbar is not None:
+            try:
+                old_cbar.remove()
+            except Exception:
+                pass
+        self._analysis_colorbar = self.analysis_canvas.figure.colorbar(im, ax=self.analysis_ax, shrink=0.8)
         self.analysis_canvas.figure.tight_layout()
         self.analysis_canvas.draw_idle()
 
