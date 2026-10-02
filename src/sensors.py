@@ -213,9 +213,16 @@ class HistoryIrradiance(RollingIrradiance):
 _LUX_PRECISION_FLOOR_COUNTS = 400  # ~10% of the 4000-count display
 
 
-def lux_poll_loop(port: str, live: LiveValue, stop_event: threading.Event, history: TimeSeriesBuffer | None = None) -> None:
+def lux_poll_loop(
+    port: str,
+    live: LiveValue,
+    stop_event: threading.Event,
+    history: TimeSeriesBuffer | None = None,
+    interval_s: float = LUX_POLL_INTERVAL_S,
+) -> None:
     """Background loop polling the Triplett LT68, mirroring the reconnect
-    backoff pattern in listen.py's run_periodic_logger()."""
+    backoff pattern in listen.py's run_periodic_logger(). interval_s is the
+    extra wait between reads; 0 reads back-to-back (time_average.py)."""
     meter = None
     reconnect_delay = 1.0
     while not stop_event.is_set():
@@ -258,7 +265,7 @@ def lux_poll_loop(port: str, live: LiveValue, stop_event: threading.Event, histo
             reconnect_delay = min(reconnect_delay * 2.0, 15.0)
             continue
 
-        if stop_event.wait(LUX_POLL_INTERVAL_S):
+        if stop_event.wait(interval_s):
             break
 
     if meter is not None:
