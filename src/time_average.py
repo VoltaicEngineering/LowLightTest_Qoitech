@@ -49,6 +49,7 @@ import sensors
 from ui_style import _STYLESHEET, _STAGE_STYLE, apply_light_theme
 from zero_offset import ZeroOffsetCapture
 
+MIN_DURATION_S = 0.2
 MAX_DURATION_S = 3600.0
 HISTORY_S = MAX_DURATION_S + 120.0  # keep a whole measurement on the graph
 GRAPH_MIN_WINDOW_S = 60.0
@@ -190,8 +191,9 @@ class TimeAverageApp(QMainWindow):
         irow = QHBoxLayout(input_box)
         iform = QFormLayout()
         self.duration_spin = QDoubleSpinBox()
-        self.duration_spin.setRange(1.0, MAX_DURATION_S)
-        self.duration_spin.setDecimals(1)
+        self.duration_spin.setRange(MIN_DURATION_S, MAX_DURATION_S)
+        self.duration_spin.setDecimals(2)
+        self.duration_spin.setSingleStep(0.1)
         self.duration_spin.setValue(10.0)
         self.duration_spin.setSuffix(" s")
         iform.addRow("Time period", self.duration_spin)
@@ -460,7 +462,7 @@ class TimeAverageApp(QMainWindow):
         frac = min(1.0, elapsed / self.duration_s) if self.duration_s > 0 else 1.0
         self.progress.setValue(int(frac * 1000))
         counts = ", ".join(f"{_QUANTITIES[k]['name']} {c.n}" for k, c in self.captures.items())
-        self.progress.setFormat(f"{elapsed:.1f} / {self.duration_s:g} s  ({counts} samples)")
+        self.progress.setFormat(f"{elapsed:.2f} / {self.duration_s:g} s  ({counts} samples)")
         if elapsed >= self.duration_s:
             self._finish_measure(stopped_early=False)
 
@@ -504,7 +506,7 @@ class TimeAverageApp(QMainWindow):
 
         elapsed = self.captures["lux"].elapsed()
         stamp = time.strftime("%H:%M:%S", time.localtime(self.captures["lux"].started_at))
-        note = f"Started {stamp}, {elapsed:.1f} s"
+        note = f"Started {stamp}, {elapsed:.2f} s"
         if stopped_early:
             note += f" (stopped early, of {self.duration_s:g} s requested)"
         self.result_note.setText(note)
