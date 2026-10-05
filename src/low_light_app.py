@@ -1459,6 +1459,16 @@ class LowLightApp(QMainWindow):
                     color=color, label=group_data["label"],
                 )
 
+        if plotted_groups:
+            # SI as a % of 1000 W/m²: where a value exactly proportional to
+            # irradiance would sit. axline leaves the autoscaled limits alone.
+            for ax in axes:
+                ax.axline(
+                    (0.0, 0.0), slope=100.0 / norm_analysis.REFERENCE_IRRADIANCE,
+                    color="#888888", linestyle=":", linewidth=1.2, zorder=1,
+                    label=f"SI as % of {norm_analysis.REFERENCE_IRRADIANCE:g} W/m²",
+                )
+
         self._style_analysis_axes()
         if plotted_groups:
             self._norm_wp_ax.legend(fontsize=6, loc="best")
