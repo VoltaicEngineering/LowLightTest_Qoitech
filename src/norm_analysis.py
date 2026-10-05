@@ -12,7 +12,10 @@ deck wasn't directly viewable):
                             of 1000 W/m^2 -- 900 <= ... <= 1100 at the
                             default 10% tolerance, adjustable in Settings)
     Norm_X (%)   = X_measured / Ref_X[group] * 100
-for X in {Wp, Vp, Ip, Isc}. A "group" is one panel, identified by the full
+for X in {Wp, Vp, Ip, Isc}. In lightbox mode the setpoint
+(lightbox_setpoint_wm2) stands in for irradiance_measured_live, both to pick
+the reference rows and as the x value -- the sensor sits at one grid node, so
+its reading is not the panel average the setpoint was set for. A "group" is one panel, identified by the full
 Panel Name entered on the Measure tab (matched case-insensitively, ignoring
 surrounding whitespace). Every panel is normalized against its own 1000 W/m^2
 measurements, and its cell_type / cells_series / cells_parallel come from its
@@ -28,6 +31,8 @@ DEFAULT_TOLERANCE = 0.10  # +/-10% of 1000 W/m^2
 REFERENCE_IRRADIANCE = 1000.0
 
 _ROW_FIELDS = ("Wp", "Vp", "Ip", "Isc")
+MEASURED_IRRADIANCE_FIELD = "irradiance_measured_live"
+SETPOINT_IRRADIANCE_FIELD = "lightbox_setpoint_wm2"
 
 
 def normalize_panel_name(panel_name: str) -> str:
@@ -138,9 +143,19 @@ def _parse_float(value):
         return None
 
 
-def compute_norm_dataset(rows, config: dict, tolerance: float = DEFAULT_TOLERANCE) -> dict:
+def compute_norm_dataset(
+    rows,
+    config: dict,
+    tolerance: float = DEFAULT_TOLERANCE,
+    irradiance_field: str = MEASURED_IRRADIANCE_FIELD,
+) -> dict:
     """Compute normalized Wp/Vp/Ip/Isc for every measurement row that
     belongs to a group with an established 1000 W/m^2 reference.
+
+    irradiance_field is the summary-CSV column used as each row's irradiance
+    (reference selection and x value): MEASURED_IRRADIANCE_FIELD normally,
+    SETPOINT_IRRADIANCE_FIELD in lightbox mode. Rows with it blank count as
+    skipped_bad_data.
 
     Always recomputed fresh from the full current dataset (rows, config) --
     no incremental/cached state to go stale, which is cheap at the data
@@ -177,7 +192,7 @@ def compute_norm_dataset(rows, config: dict, tolerance: float = DEFAULT_TOLERANC
             skipped_no_config += 1
             continue
 
-        irradiance = _parse_float(row.get("irradiance_measured_live"))
+        irradiance = _parse_float(row.get(irradiance_field))
         values = {field: _parse_float(row.get(field)) for field in _ROW_FIELDS}
         if irradiance is None or irradiance <= 0 or any(v is None for v in values.values()):
             skipped_bad_data += 1

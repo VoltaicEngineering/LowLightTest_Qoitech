@@ -1153,7 +1153,7 @@ class LowLightApp(QMainWindow):
         ]
         for ax, title in specs:
             ax.set_title(title, fontsize=10)
-            ax.set_xlabel("Irradiance (W/m²)", fontsize=8)
+            ax.set_xlabel("Setpoint (W/m²)" if self.lightbox_mode else "Irradiance (W/m²)", fontsize=8)
             ax.set_ylabel("%", fontsize=8)
             ax.grid(True, alpha=0.3)
             ax.tick_params(labelsize=7)
@@ -1363,6 +1363,8 @@ class LowLightApp(QMainWindow):
         nearest = None
         nearest_dist = None
         for line in ax.get_lines():
+            if line.get_gid() == "si_reference":
+                continue
             xdata, ydata = line.get_xdata(), line.get_ydata()
             if len(xdata) == 0:
                 continue
@@ -1380,7 +1382,7 @@ class LowLightApp(QMainWindow):
             return
 
         x, y, label = nearest
-        text = f"{label}\nIrr: {x:.0f} W/m²\n{y:.1f}%"
+        text = f"{label}\n{'SI' if self.lightbox_mode else 'Irr'}: {x:.4g} W/m²\n{y:.1f}%"
         if self._analysis_hover_annotation is None or self._analysis_hover_annotation.axes is not ax:
             if self._analysis_hover_annotation is not None:
                 self._analysis_hover_annotation.remove()
@@ -1410,7 +1412,14 @@ class LowLightApp(QMainWindow):
             return
 
         tolerance = self.settings.get("reference_tolerance_pct", 3.0) / 100.0
-        result = norm_analysis.compute_norm_dataset(rows, self.panel_config, tolerance=tolerance)
+        # Lightbox: plot against the setpoint (the panel average the light was
+        # set for), not the sensor's single-node reading.
+        irradiance_field = (
+            norm_analysis.SETPOINT_IRRADIANCE_FIELD if self.lightbox_mode else norm_analysis.MEASURED_IRRADIANCE_FIELD
+        )
+        result = norm_analysis.compute_norm_dataset(
+            rows, self.panel_config, tolerance=tolerance, irradiance_field=irradiance_field
+        )
         groups = result["groups"]
 
         selected_panels = {
@@ -1466,7 +1475,7 @@ class LowLightApp(QMainWindow):
                 ax.axline(
                     (0.0, 0.0), slope=100.0 / norm_analysis.REFERENCE_IRRADIANCE,
                     color="#888888", linestyle=":", linewidth=1.2, zorder=1,
-                    label=f"SI as % of {norm_analysis.REFERENCE_IRRADIANCE:g} W/m²",
+                    label=f"SI as % of {norm_analysis.REFERENCE_IRRADIANCE:g} W/m²", gid="si_reference",
                 )
 
         self._style_analysis_axes()
