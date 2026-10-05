@@ -89,6 +89,26 @@ class Calibration:
     def expected(self, vac: float, irr_node: str, lux_node: str, w_mm: float, h_mm: float) -> dict:
         return cr.expected_at_vac(self.passes, self.grid, vac, {"irr": irr_node, "lux": lux_node}, w_mm, h_mm)
 
+    def vac_for_setpoint(self, setpoint: float, w_mm: float, h_mm: float) -> tuple[float, bool]:
+        """(VAC, extrapolated?) for a panel-average irradiance setpoint, exactly
+        as light_setting() works it out. Outside the calibrated range the power
+        law of the two end levels is carried on instead of refusing."""
+        pts = sorted((p["vac"], cr.panel_average(p["filled"], self.grid, w_mm, h_mm))
+                     for (_level, q), p in self.passes.items() if q == "irr")
+        if pts[0][1] <= setpoint <= pts[-1][1]:
+            return cr.vac_for_target(self.passes, self.grid, w_mm, h_mm, setpoint, "irr")["vac"], False
+        (v0, y0), (v1, y1) = pts[:2] if setpoint < pts[0][1] else pts[-2:]
+        return cr._loglog(v0, y0, v1, y1, setpoint), True
+
+    def expected_at_node(self, vac: float, quantity: str, node: str) -> tuple[float, bool]:
+        """(expected reading, extrapolated?) for one sensor at `node` and
+        `vac`. Used when a saved row's node is corrected after the fact, so a
+        VAC just outside the calibrated range (rows set below the lowest
+        level) is extrapolated rather than refused."""
+        extrapolated = not (self.vacs[0] - 1e-9 <= vac <= self.vacs[-1] + 1e-9)
+        exp = cr.expected_at_vac(self.passes, self.grid, vac, {quantity: node}, extrapolate=True)
+        return exp["nodes"][quantity]["value"], extrapolated
+
 
 @dataclass
 class Round:

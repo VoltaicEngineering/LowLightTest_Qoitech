@@ -142,10 +142,22 @@ _LIGHTBOX_COLUMNS = [
     ("Lux Dev (%)", "lux_deviation_pct", "+.1f"),
 ]
 _COLUMNS = _COLUMNS + [c[0] for c in _LIGHTBOX_COLUMNS]
+_LIGHTBOX_COL = {key: _NOTES_COL + 1 + i for i, (_h, key, _s) in enumerate(_LIGHTBOX_COLUMNS)}
+# Sensor-node cells a saved lightbox row lets you correct (after a confirm),
+# e.g. when the sensor's position was entered wrong: column -> quantity.
+_LIGHTBOX_NODE_COLS = {_LIGHTBOX_COL["irr_node"]: "irr", _LIGHTBOX_COL["lux_node"]: "lux"}
 
 
 def _log(level: str, event: str, **fields) -> None:
     sensors._log(level, event, **fields)
+
+
+def _float_or_none(value):
+    """Summary-row value (float, or text from the CSV) -> float, else None."""
+    try:
+        return float(value) if value not in ("", None) else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -3486,14 +3498,19 @@ class LowLightApp(QMainWindow):
                 except (TypeError, ValueError):
                     pass
             values.append("" if value is None else value)
+        node_editable = row.get("lightbox_setpoint_wm2") not in ("", None)
         for col, value in enumerate(values):
-            self.table.setItem(r, col, _item(value, col in _EDITABLE_COLS))
+            editable = col in _EDITABLE_COLS or (node_editable and col in _LIGHTBOX_NODE_COLS)
+            self.table.setItem(r, col, _item(value, editable))
 
         self.table.blockSignals(False)
 
     def _on_table_item_changed(self, item: QTableWidgetItem):
         col = item.column()
         row_idx = item.row()
+        if col in _LIGHTBOX_NODE_COLS and row_idx < len(self.session_rows):
+            self._on_lightbox_node_edited(item, _LIGHTBOX_NODE_COLS[col])
+            return
         field = _FIELD_MAP.get(col)
         if field is None or row_idx >= len(self.session_rows):
             return
@@ -3520,6 +3537,122 @@ class LowLightApp(QMainWindow):
 
         if field == "panel_name":
             self._refresh_analysis_tab()
+
+    def _set_table_text(self, row_idx: int, col: int, text: str) -> None:
+        item = self.table.item(row_idx, col)
+        if item is None:
+            return
+        self.table.blockSignals(True)
+        item.setText(text)
+        self.table.blockSignals(False)
+
+    def _calibration_for_row(self, row: dict):
+        """The calibration a saved lightbox row was measured with, from its
+        calibration_campaign ("<id>" or "<id> (<folder name>)"). Looks at the
+        loaded calibration first, then for that folder next to it and in
+        <project>/calibration. Raises ValueError if it cannot be found."""
+        campaign = str(row.get("calibration_campaign", "") or "").strip()
+        if not campaign:
+            raise ValueError("this row has no calibration campaign recorded")
+        m = re.fullmatch(r"(.*?) \((.+)\)", campaign)
+        campaign_id, folder_name = (m.group(1), m.group(2)) if m else (campaign, campaign)
+        cal = self.lb_calibration
+        if cal is not None and cal.folder.name == folder_name and cal.campaign_id == campaign_id:
+            return cal
+        cache = self.__dict__.setdefault("_row_calibration_cache", {})
+        if folder_name in cache:
+            return cache[folder_name]
+        roots = [PROJECT_ROOT / "calibration"]
+        if self.settings.get("lightbox_campaign_path"):
+            roots.insert(0, Path(self.settings["lightbox_campaign_path"]).parent)
+        for root in roots:
+            if (root / folder_name / "campaign.json").exists():
+                cache[folder_name] = lbm.Calibration(root / folder_name)
+                return cache[folder_name]
+        raise ValueError(f"calibration folder {folder_name} not found in " + " or ".join(str(r) for r in roots))
+
+    def _on_lightbox_node_edited(self, item: QTableWidgetItem, quantity: str) -> None:
+        """A saved row's Irr Node / Lux Node was edited: confirm, then
+        recompute that sensor's expected reading and deviation from the
+        row's calibration and VAC target, and rewrite the summary CSV.
+        Anything else (cancel, bad node, no calibration) puts the old node
+        back, so a measured row is never changed by accident."""
+        row_idx = item.row()
+        row = self.session_rows[row_idx]
+        node_key, exp_key, dev_key = f"{quantity}_node", f"{quantity}_expected", f"{quantity}_deviation_pct"
+        name = "Irradiance" if quantity == "irr" else "Lux"
+        old_node = str(row.get(node_key, "") or "")
+        new_node = item.text().strip().upper()
+
+        def revert(message=None):
+            self._set_table_text(row_idx, item.column(), old_node)
+            if message:
+                QMessageBox.warning(self, f"{name} node not changed", message)
+
+        if new_node == old_node.upper():
+            revert()
+            return
+        try:
+            cal = self._calibration_for_row(row)
+            if new_node not in cal.node_labels():
+                raise ValueError(f"{new_node or '(blank)'} is not a node on the calibration grid "
+                                 f"({cal.node_labels()[0]}-{cal.node_labels()[-1]})")
+            # The VAC the row's Exp came from: recomputed from setpoint and
+            # panel size (vac_target in the CSV is rounded to 0.01 V), else
+            # the stored one.
+            setpoint = _float_or_none(row.get("lightbox_setpoint_wm2"))
+            w, h = _float_or_none(row.get("panel_width_mm")), _float_or_none(row.get("panel_height_mm"))
+            if setpoint and w and h:
+                vac, vac_extrapolated = cal.vac_for_setpoint(setpoint, w, h)
+            else:
+                vac, vac_extrapolated = _float_or_none(row.get("vac_target")), False
+            if vac is None:
+                raise ValueError("this row has no VAC target recorded")
+            expected, extrapolated = cal.expected_at_node(vac, quantity, new_node)
+            extrapolated = extrapolated or vac_extrapolated
+        except Exception as e:
+            revert(f"Run {row.get('run_index', row_idx + 1)}: {e}.")
+            return
+
+        if quantity == "irr":
+            raw = _float_or_none(row.get("irradiance_measured_live"))
+            offset = _float_or_none(row.get("irr_dark_offset")) or 0.0
+            measured = raw - offset if raw is not None else None
+        else:
+            measured = _float_or_none(row.get("lux_measured"))
+        dev = lbm.deviation_pct(measured, expected)
+        old_dev = _float_or_none(row.get(dev_key))
+
+        def pct(v):
+            return "—" if v is None else f"{v:+.1f}%"
+
+        resp = QMessageBox.question(
+            self, f"Change {name} node?",
+            f"Run {row.get('run_index', row_idx + 1)} ({row.get('panel_name', '')}) is a saved measurement "
+            f"recorded with the {name.lower()} sensor at {old_node or '(blank)'}.\n\n"
+            f"Change it to {new_node}? Only do this if the sensor position was recorded wrong.\n\n"
+            f"{name} Exp and Dev are recalculated from {cal.campaign_id} at {vac:g} VAC"
+            + (" (extrapolated: outside the calibrated VAC range)" if extrapolated else "") + ":\n"
+            f"    Dev {pct(old_dev)}  ->  {pct(dev)}\n\n"
+            "The summary CSV is rewritten.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            revert()
+            return
+
+        row[node_key] = new_node
+        row[exp_key] = round(float(expected), 6 if quantity == "irr" else 4)
+        row[dev_key] = "" if dev is None else round(float(dev), 2)
+        for key in (node_key, exp_key, dev_key):
+            spec = next(s for _h, k, s in _LIGHTBOX_COLUMNS if k == key)
+            value = row[key]
+            self._set_table_text(row_idx, _LIGHTBOX_COL[key], format(value, spec) if spec and value != "" else str(value))
+        self._rewrite_summary_csv()
+        self.set_status(
+            f"Run {row.get('run_index', row_idx + 1)}: {name.lower()} node {old_node or '(blank)'} -> {new_node}, "
+            f"Dev {pct(old_dev)} -> {pct(dev)}.", "info",
+        )
 
     def _rewrite_summary_csv(self) -> None:
         """Rewrite the whole working folder's summary CSV from

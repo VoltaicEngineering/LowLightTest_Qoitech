@@ -353,7 +353,7 @@ def vac_for_target(passes, grid, w_mm, l_mm, target, quantity="irr", sensor_node
     }
 
 
-def expected_at_vac(passes, grid, vac, nodes, w_mm=None, l_mm=None):
+def expected_at_vac(passes, grid, vac, nodes, w_mm=None, l_mm=None, extrapolate=False):
     """What the calibration predicts at an arbitrary VAC.
 
     nodes, e.g. {"irr": "B6", "lux": "J6"}: for each quantity, the node's own
@@ -361,12 +361,13 @@ def expected_at_vac(passes, grid, vac, nodes, w_mm=None, l_mm=None):
     value ~ VAC^n (n from those two points; exact at a measured level). With a
     panel size, the panel averages of both quantities come back too, by the
     same rule. Raises ValueError outside the measured VAC range or when a
-    value needed is <= 0."""
+    value needed is <= 0. extrapolate=True instead carries the power law of the
+    two lowest (or highest) levels past the end of the range."""
     levels = sorted({l for (l, q) in passes}, key=lambda l: passes[(l, "irr")]["vac"])
     vacs = [passes[(l, "irr")]["vac"] for l in levels]
-    if not (vacs[0] - 1e-9 <= vac <= vacs[-1] + 1e-9):
+    if not (vacs[0] - 1e-9 <= vac <= vacs[-1] + 1e-9) and not extrapolate:
         raise ValueError(f"{vac:g} VAC is outside the calibrated range ({vacs[0]:g} to {vacs[-1]:g} VAC).")
-    i = min(max(k for k in range(len(vacs)) if vacs[k] <= vac + 1e-9), len(vacs) - 2)
+    i = min(max([k for k in range(len(vacs)) if vacs[k] <= vac + 1e-9], default=0), len(vacs) - 2)
     la, lb = levels[i], levels[i + 1]
     va_, vb_ = vacs[i], vacs[i + 1]
 
