@@ -266,6 +266,10 @@ class LightboxCalibrationApp(QMainWindow):
         self.capture_in_progress = False
         self.capture_samples: list[float] = []
         self.capture_start_ts = 0.0
+        self._capture_mode = "run"
+        self._capture_quantity = "lux"
+        self._adhoc_undo: dict | None = None
+        self._adhoc_replacing: dict | None = None
         self.last_capture_id: str | None = None
         self._undo_snapshot: dict | None = None
         self._last_active_quantity: str = "lux"
@@ -389,6 +393,10 @@ class LightboxCalibrationApp(QMainWindow):
 
         self.run_tab = self._build_run_tab()
         self._tab_widget.addTab(self.run_tab, "Run")
+
+        self.adhoc_tab = self._build_adhoc_tab()
+        self._tab_widget.addTab(self.adhoc_tab, "Add Points")
+        self._tab_widget.currentChanged.connect(self._guard(self._on_tab_changed))
 
         self.analysis_tab = self._build_analysis_tab()
         self._tab_widget.addTab(self.analysis_tab, "Analysis")
@@ -694,6 +702,9 @@ class LightboxCalibrationApp(QMainWindow):
         self.run_grid.sensor_node = config["sensor_node"]
         self.run_grid.covered_nodes = set(cm.effective_covered_nodes(config, self.grid))
         self._rebuild_run_grid()
+        self._adhoc_undo = None
+        self.adhoc_undo_btn.setEnabled(False)
+        self._refresh_adhoc_tab()
         # Reset the cursor here rather than leaving a stale one from whatever
         # campaign was previously loaded in this app instance; callers that
         # are resuming set the real cursor right after this and call
@@ -903,6 +914,11 @@ class LightboxCalibrationApp(QMainWindow):
         unit = "lx" if self._last_active_quantity == "lux" else "W/m²"
         self.live_readout_lbl.setText(f"{active_val:.2f} {unit}" if active_val is not None else "-- ")
 
+        adhoc_lux = self.adhoc_quantity_combo.currentText() == "lux"
+        adhoc_val = lux_value if adhoc_lux else irr_value
+        adhoc_unit = "lx" if adhoc_lux else "W/m²"
+        self.adhoc_readout_lbl.setText(f"{adhoc_val:.2f} {adhoc_unit}" if adhoc_val is not None else "-- ")
+
     def _redraw_timeseries(self) -> None:
         now = time.time()
         lux_times, lux_values = self.lux_history.snapshot()
@@ -922,8 +938,11 @@ class LightboxCalibrationApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _sim_tick(self) -> None:
+        adhoc = self.config is not None and self._tab_widget.currentWidget() is self.adhoc_tab
         if self.config is None:
             node_label = cm.DEFAULT_REFERENCE_NODE
+        elif adhoc:
+            node_label = self.adhoc_grid.current_node or self.config["reference_node"]
         elif self.cursor is not None:
             node_label = self.cursor["node_label"]
         else:
@@ -939,7 +958,7 @@ class LightboxCalibrationApp(QMainWindow):
         except ValueError:
             x_mm, y_mm = 0.0, 0.0
 
-        vac = self.current_level_variac or 50.0
+        vac = (self._adhoc_level_vac() if adhoc else None) or self.current_level_variac or 50.0
         drift_fraction = min(1.0, (time.time() - self.pass_start_ts) / 300.0)
 
         lux_val = simulate_field_value(x_mm, y_mm, self.grid, vac, "lux", drift_fraction)
@@ -1080,7 +1099,9 @@ class LightboxCalibrationApp(QMainWindow):
         self.run_grid.redone_nodes = superseded_nodes
         self.run_grid.update()
 
-    def _paint_capture_cell(self, record: dict) -> None:
+    def _paint_capture_cell(self, record: dict, grid_widget: GridWidget | None = None) -> None:
+        if grid_widget is None:
+            grid_widget = self.run_grid
         label = record["node_label"]
         if record.get("note") in ("skipped", "pass_ended_early"):
             state = "skipped"
@@ -1088,17 +1109,17 @@ class LightboxCalibrationApp(QMainWindow):
             state = "flagged"
         else:
             state = "captured"
-        self.run_grid.cell_state[label] = state
-        self.run_grid.cell_value[label] = record.get("mean")
+        grid_widget.cell_state[label] = state
+        grid_widget.cell_value[label] = record.get("mean")
         if record.get("mean") is not None:
             stdev = record.get("stdev")
             pct = record.get("three_sigma_pct")
-            self.run_grid.hover_text[label] = (
+            grid_widget.hover_text[label] = (
                 f"{label}: {record['mean']:.2f} ± {stdev:.2f} (3σ/avg {pct:.1f}%, n={record['n_samples']})"
                 if stdev is not None else f"{label}: {record['mean']:.2f} (n={record['n_samples']})"
             )
         else:
-            self.run_grid.hover_text[label] = f"{label}: skipped"
+            grid_widget.hover_text[label] = f"{label}: skipped"
 
     def _highlight_current_node(self) -> None:
         self.run_grid.current_node = self.cursor["node_label"] if self.cursor else None
@@ -1192,12 +1213,22 @@ class LightboxCalibrationApp(QMainWindow):
     # -- Capture -----------------------------------------------------------
 
     def _on_capture_clicked(self) -> None:
+        if self._tab_widget.currentWidget() is self.adhoc_tab:
+            self._on_adhoc_capture_clicked()
+            return
         if self._tab_widget.currentWidget() is not self.run_tab:
             return
         if self.capture_in_progress or self.warmup_active or self.paused or self.cursor is None:
             return
-        self.capture_in_progress = True
         self.capture_btn.setEnabled(False)
+        self._start_sampling("run", self.cursor["pass"])
+
+    def _start_sampling(self, mode: str, quantity: str) -> None:
+        """Shared dwell sampler for the Run tab ("run") and the Add Points
+        tab ("adhoc"); _finish_capture hands the samples to the right one."""
+        self.capture_in_progress = True
+        self._capture_mode = mode
+        self._capture_quantity = quantity
         self.capture_start_ts = time.time()
         self.capture_samples = []
         self._capture_timer = QTimer(self)
@@ -1206,7 +1237,7 @@ class LightboxCalibrationApp(QMainWindow):
         self._capture_timer.start()
 
     def _capture_tick(self) -> None:
-        quantity = self.cursor["pass"]
+        quantity = self._capture_quantity
         if quantity == "lux":
             value, _, _ = self.lux_live.snapshot()
         else:
@@ -1216,17 +1247,25 @@ class LightboxCalibrationApp(QMainWindow):
 
         dwell = self.config["dwell_seconds"]
         elapsed = time.time() - self.capture_start_ts
-        self.capture_progress.setValue(int(min(1.0, elapsed / dwell) * 100))
+        progress = self.adhoc_progress if self._capture_mode == "adhoc" else self.capture_progress
+        progress.setValue(int(min(1.0, elapsed / dwell) * 100))
         if elapsed >= dwell:
             self._capture_timer.stop()
             self._finish_capture()
 
+    def _capture_port(self, quantity: str) -> str:
+        if self.simulate:
+            return "SIMULATED"
+        combo = self.lux_port_combo if quantity == "lux" else self.irr_port_combo
+        return combo.currentData() or ""
+
     def _finish_capture(self) -> None:
+        if self._capture_mode == "adhoc":
+            self._finish_adhoc_capture()
+            return
         cursor = self.cursor
         duration = time.time() - self.capture_start_ts
-        port = self.lux_port_combo.currentData() if (not self.simulate and cursor["pass"] == "lux") else (
-            self.irr_port_combo.currentData() if not self.simulate else "SIMULATED"
-        )
+        port = self._capture_port(cursor["pass"])
         record = cm.make_capture_record(
             campaign_id=self.config["campaign_id"], level_index=cursor["level_index"],
             variac_vac=self.current_level_variac, quantity=cursor["pass"], capture_kind=cursor["next_kind"],
@@ -1239,19 +1278,21 @@ class LightboxCalibrationApp(QMainWindow):
         self.capture_progress.setValue(0)
         self._refresh_after_capture(record)
 
-    def _show_result_card(self, record: dict) -> None:
+    def _show_result_card(self, record: dict, card: QLabel | None = None) -> None:
+        if card is None:
+            card = self.result_card
         if record.get("mean") is None:
-            self.result_card.setText(f"{record['node_label']}: skipped")
-            self.result_card.setStyleSheet(_STAGE_STYLE["warning"])
+            card.setText(f"{record['node_label']}: skipped")
+            card.setStyleSheet(_STAGE_STYLE["warning"])
             return
         stdev = record.get("stdev")
         pct = record.get("three_sigma_pct")
         text = f"{record['node_label']} ({record['capture_kind']}): {record['mean']:.2f} ± {stdev or 0:.2f}"
         if pct is not None:
             text += f"  (3σ/avg {pct:.1f}%, n={record['n_samples']})"
-        self.result_card.setText(text)
+        card.setText(text)
         stage = "warning" if (pct is not None and pct > AMBER_3SIGMA_PCT) else "success"
-        self.result_card.setStyleSheet(_STAGE_STYLE[stage])
+        card.setStyleSheet(_STAGE_STYLE[stage])
 
     def _refresh_after_capture(self, record: dict) -> None:
         self.captures_cache = cm.read_captures(self.captures_csv)
@@ -1513,6 +1554,323 @@ class LightboxCalibrationApp(QMainWindow):
         self._rebuild_run_grid()
         self._update_header()
         self.set_status(f"Redoing {label} -- capture will continue from where you left off afterward.", "info")
+
+    # ------------------------------------------------------------------
+    # Add Points tab -- single-node captures into an existing campaign, to
+    # fill gaps (skipped nodes, a pass ended early, a glitch) without a whole
+    # sweep. Each point is an ordinary "grid" row in captures.csv (note
+    # "adhoc", the node's serpentine index), so the report, the Analysis tab
+    # and the measurement app use it with no special handling. Whatever it
+    # replaces is superseded, never deleted.
+    # ------------------------------------------------------------------
+
+    def _build_adhoc_tab(self) -> QWidget:
+        outer = QWidget()
+        layout = QVBoxLayout(outer)
+
+        top = QHBoxLayout()
+        self.adhoc_campaign_lbl = QLabel("No campaign loaded")
+        self.adhoc_campaign_lbl.setStyleSheet("font-size:12pt; font-weight:bold; padding:6px;")
+        open_btn = QPushButton("Open Campaign…")
+        open_btn.clicked.connect(self._guard(self._adhoc_open_campaign))
+        top.addWidget(self.adhoc_campaign_lbl, 1)
+        top.addWidget(open_btn)
+        layout.addLayout(top)
+
+        sel = QHBoxLayout()
+        self.adhoc_level_combo = QComboBox()
+        self.adhoc_level_combo.setMinimumWidth(170)
+        self.adhoc_quantity_combo = QComboBox()
+        self.adhoc_quantity_combo.addItems(list(cm.QUANTITIES))
+        for combo in (self.adhoc_level_combo, self.adhoc_quantity_combo):
+            combo.currentIndexChanged.connect(self._guard(self._on_adhoc_selection_changed))
+        next_btn = QPushButton("Next Missing Node")
+        next_btn.clicked.connect(self._guard(self._adhoc_select_next_missing))
+        sel.addWidget(QLabel("Level"))
+        sel.addWidget(self.adhoc_level_combo)
+        sel.addWidget(QLabel("Quantity"))
+        sel.addWidget(self.adhoc_quantity_combo)
+        sel.addWidget(next_btn)
+        sel.addStretch()
+        layout.addLayout(sel)
+
+        self.adhoc_banner = QLabel("Open a campaign to add points to it.")
+        self.adhoc_banner.setWordWrap(True)
+        self.adhoc_banner.setStyleSheet(_STAGE_STYLE["info"])
+        layout.addWidget(self.adhoc_banner)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(split, 1)
+
+        grid_col = QVBoxLayout()
+        grid_hint = QLabel("Click a node to select it. Pale = no value yet, grey = skipped.")
+        grid_hint.setStyleSheet("color:#555; font-size:9pt;")
+        grid_col.addWidget(grid_hint)
+        self.adhoc_grid = GridWidget(self.grid, clickable=True)
+        self.adhoc_grid.on_node_clicked = lambda label: self._guard(lambda: self._on_adhoc_node_clicked(label))()
+        grid_col.addWidget(self.adhoc_grid, 1)
+        grid_wrap = QWidget()
+        grid_wrap.setLayout(grid_col)
+        split.addWidget(grid_wrap)
+
+        panel = QWidget()
+        play = QVBoxLayout(panel)
+        self.adhoc_node_lbl = QLabel("Node: click one on the grid")
+        self.adhoc_node_lbl.setStyleSheet("font-size:12pt; font-weight:bold;")
+        self.adhoc_node_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        play.addWidget(self.adhoc_node_lbl)
+
+        self.adhoc_readout_lbl = QLabel("--")
+        self.adhoc_readout_lbl.setStyleSheet("font-size:28pt; font-weight:bold;")
+        self.adhoc_readout_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        play.addWidget(self.adhoc_readout_lbl)
+
+        self.adhoc_capture_btn = QPushButton("Capture Point  (Space / Enter / F)")
+        self.adhoc_capture_btn.setProperty("primary", True)
+        self.adhoc_capture_btn.clicked.connect(self._guard(self._on_adhoc_capture_clicked))
+        self.adhoc_capture_btn.setEnabled(False)
+        play.addWidget(self.adhoc_capture_btn)
+
+        self.adhoc_progress = QProgressBar()
+        self.adhoc_progress.setRange(0, 100)
+        play.addWidget(self.adhoc_progress)
+
+        self.adhoc_result_card = QLabel("")
+        self.adhoc_result_card.setWordWrap(True)
+        self.adhoc_result_card.setStyleSheet(_STAGE_STYLE["info"])
+        play.addWidget(self.adhoc_result_card)
+
+        self.adhoc_undo_btn = QPushButton("Undo Last Point")
+        self.adhoc_undo_btn.setToolTip("Removes the last point added here and restores whatever it replaced.")
+        self.adhoc_undo_btn.setEnabled(False)
+        self.adhoc_undo_btn.clicked.connect(self._guard(self._adhoc_undo_last))
+        play.addWidget(self.adhoc_undo_btn)
+
+        play.addStretch()
+        split.addWidget(panel)
+        split.setSizes([700, 400])
+        return outer
+
+    def _on_tab_changed(self) -> None:
+        if self._tab_widget.currentWidget() is self.adhoc_tab:
+            self._refresh_adhoc_tab()
+
+    def _adhoc_open_campaign(self) -> None:
+        if self.capture_in_progress:
+            self.set_status("Wait for the current capture to finish.", "warning")
+            return
+        start = str(self.campaign_dir.parent) if self.campaign_dir else str(DEFAULT_CALIBRATION_DIR)
+        folder = QFileDialog.getExistingDirectory(self, "Open campaign", start)
+        if not folder:
+            return
+        try:
+            config = cm.load_campaign_config(Path(folder))
+        except Exception as e:
+            QMessageBox.warning(self, "Could not open", f"Failed to read campaign.json: {e}")
+            return
+        self._load_campaign(Path(folder), config)
+        levels = config.get("levels", [])
+        if levels:
+            self.current_level_index = levels[-1]["level_index"]
+            self.current_level_variac = levels[-1]["variac_vac"]
+        self.set_status(
+            f"Opened {config['campaign_id']} for adding points. To continue a sweep, use Resume Campaign in Setup.",
+            "success",
+        )
+
+    def _adhoc_levels(self) -> dict[int, float]:
+        """{level_index: VAC} for every level in the campaign: campaign.json
+        first, captures.csv for any level it doesn't list."""
+        levels = {}
+        for c in self.captures_cache:
+            if c.get("level_index") is not None and c.get("variac_vac") is not None:
+                levels.setdefault(c["level_index"], c["variac_vac"])
+        for level in (self.config or {}).get("levels", []):
+            levels[level["level_index"]] = level["variac_vac"]
+        return dict(sorted(levels.items()))
+
+    def _adhoc_level_vac(self) -> float | None:
+        level_index = self.adhoc_level_combo.currentData()
+        return None if level_index is None else self._adhoc_levels().get(level_index)
+
+    def _adhoc_pass_rows(self) -> list[dict]:
+        level_index = self.adhoc_level_combo.currentData()
+        quantity = self.adhoc_quantity_combo.currentText()
+        return [
+            c for c in cm.active_captures(self.captures_cache)
+            if c["level_index"] == level_index and c["quantity"] == quantity
+        ]
+
+    def _refresh_adhoc_tab(self) -> None:
+        if self.config is None:
+            self.adhoc_campaign_lbl.setText("No campaign loaded")
+            self._update_adhoc_controls()
+            return
+        self.adhoc_campaign_lbl.setText(f"Campaign {self.config['campaign_id']}")
+        if self.adhoc_grid.grid is not self.grid:
+            self.adhoc_grid.set_grid(self.grid)
+            self.adhoc_grid.current_node = None
+        self.adhoc_grid.reference_node = self.config["reference_node"]
+        self.adhoc_grid.sensor_node = self.config["sensor_node"]
+        self.adhoc_grid.covered_nodes = set(cm.effective_covered_nodes(self.config, self.grid))
+
+        keep = self.adhoc_level_combo.currentData()
+        levels = self._adhoc_levels()
+        self.adhoc_level_combo.blockSignals(True)
+        self.adhoc_level_combo.clear()
+        for level_index, vac in levels.items():
+            self.adhoc_level_combo.addItem(f"L{level_index} · {vac:.1f} VAC", level_index)
+        if levels:
+            self.adhoc_level_combo.setCurrentIndex(
+                list(levels).index(keep) if keep in levels else len(levels) - 1
+            )
+        self.adhoc_level_combo.blockSignals(False)
+        self._on_adhoc_selection_changed()
+
+    def _on_adhoc_selection_changed(self) -> None:
+        self.adhoc_grid.reset_cells()
+        if self.config is None:
+            self._update_adhoc_controls()
+            return
+        level_index = self.adhoc_level_combo.currentData()
+        quantity = self.adhoc_quantity_combo.currentText()
+        rows = self._adhoc_pass_rows()
+        for c in rows:
+            if c["capture_kind"] == "grid":
+                self._paint_capture_cell(c, self.adhoc_grid)
+
+        have = {c["node_label"] for c in rows if c["capture_kind"] == "grid" and c.get("mean") is not None}
+        n_missing = sum(1 for label in cm.all_node_labels(self.grid) if label not in have)
+        has_refs = all(
+            any(c["capture_kind"] == kind and c.get("mean") is not None for c in rows)
+            for kind in ("ref_start", "ref_end")
+        )
+        if level_index is None:
+            text, stage = "This campaign has no levels yet -- start one in the Run tab.", "warning"
+        elif not has_refs:
+            text, stage = (
+                f"L{level_index} {quantity.upper()} has no start/end reference capture, so the report and "
+                "Analysis ignore this pass. Finish it in the Run tab (Setup → Resume Campaign).", "warning",
+            )
+        else:
+            text, stage = (
+                f"Set the variac to {self._adhoc_level_vac():.1f} VAC and let the lamps warm up before "
+                f"capturing.   {n_missing} node(s) in L{level_index} {quantity.upper()} have no value.", "info",
+            )
+        self.adhoc_banner.setText(text)
+        self.adhoc_banner.setStyleSheet(_STAGE_STYLE[stage])
+        self._update_adhoc_controls()
+
+    def _update_adhoc_controls(self) -> None:
+        node = self.adhoc_grid.current_node
+        self.adhoc_node_lbl.setText(f"Node: {node}" if node else "Node: click one on the grid")
+        self.adhoc_capture_btn.setEnabled(
+            self.config is not None and node is not None
+            and self.adhoc_level_combo.currentData() is not None and not self.capture_in_progress
+        )
+        self.adhoc_grid.update()
+
+    def _on_adhoc_node_clicked(self, label: str) -> None:
+        if self.capture_in_progress or self.config is None:
+            return
+        self.adhoc_grid.current_node = label
+        self._update_adhoc_controls()
+
+    def _adhoc_select_next_missing(self) -> None:
+        if self.config is None or self.capture_in_progress:
+            return
+        have = {
+            c["node_label"] for c in self._adhoc_pass_rows()
+            if c["capture_kind"] == "grid" and c.get("mean") is not None
+        }
+        order = cm.serpentine_labels(self.grid)
+        current = self.adhoc_grid.current_node
+        start = order.index(current) + 1 if current in order else 0
+        for label in order[start:] + order[:start]:
+            if label not in have:
+                self._on_adhoc_node_clicked(label)
+                return
+        self.set_status("Every node in this pass has a value.", "success")
+
+    def _on_adhoc_capture_clicked(self) -> None:
+        if self.capture_in_progress or not self.adhoc_capture_btn.isEnabled():
+            return
+        node = self.adhoc_grid.current_node
+        level_index = self.adhoc_level_combo.currentData()
+        quantity = self.adhoc_quantity_combo.currentText()
+        existing = [c for c in self._adhoc_pass_rows() if c["capture_kind"] == "grid" and c["node_label"] == node]
+        measured = [c for c in existing if c.get("mean") is not None]
+        if measured:
+            unit = "lx" if quantity == "lux" else "W/m²"
+            resp = QMessageBox.question(
+                self, "Replace measured value?",
+                f"{node} {quantity.upper()} at L{level_index} already reads {measured[-1]['mean']:.4g} {unit}.\n\n"
+                "Capture a new value to replace it? The old row stays in captures.csv (superseded) "
+                "and Undo Last Point restores it.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+        self._adhoc_replacing = {
+            "level_index": level_index, "quantity": quantity, "node_label": node,
+            "vac": self._adhoc_level_vac(), "old_ids": [c["capture_id"] for c in existing],
+        }
+        self.adhoc_capture_btn.setEnabled(False)
+        self.adhoc_level_combo.setEnabled(False)
+        self.adhoc_quantity_combo.setEnabled(False)
+        self._start_sampling("adhoc", quantity)
+
+    def _finish_adhoc_capture(self) -> None:
+        target, self._adhoc_replacing = self._adhoc_replacing, None
+        quantity, node = target["quantity"], target["node_label"]
+        record = cm.make_capture_record(
+            campaign_id=self.config["campaign_id"], level_index=target["level_index"],
+            variac_vac=target["vac"], quantity=quantity, capture_kind="grid", node_label_=node,
+            grid=self.grid, sequence_index=cm.serpentine_labels(self.grid).index(node),
+            samples=self.capture_samples, duration_s=time.time() - self.capture_start_ts,
+            sensor_port=self._capture_port(quantity), note="adhoc",
+        )
+        self.capture_in_progress = False
+        self.adhoc_progress.setValue(0)
+        self.adhoc_level_combo.setEnabled(True)
+        self.adhoc_quantity_combo.setEnabled(True)
+
+        if record["mean"] is None:
+            self._update_adhoc_controls()
+            self.set_status(
+                f"No {quantity} readings during the dwell -- is the sensor connected? Nothing was saved.", "error",
+            )
+            return
+
+        # Append before superseding: a crash in between leaves both rows
+        # active, and every reader takes the later one.
+        cm.append_capture(self.captures_csv, record)
+        for capture_id in target["old_ids"]:
+            cm.mark_superseded(self.captures_csv, capture_id)
+        self._adhoc_undo = {"new_id": record["capture_id"], "old_ids": target["old_ids"], "node_label": node}
+        self.adhoc_undo_btn.setEnabled(True)
+        self.captures_cache = cm.read_captures(self.captures_csv)
+
+        self._show_result_card(record, self.adhoc_result_card)
+        self._on_adhoc_selection_changed()
+        self.set_status(
+            f"Added {node} {quantity.upper()} at L{target['level_index']} ({target['vac']:.1f} VAC).", "success",
+        )
+
+    def _adhoc_undo_last(self) -> None:
+        snap = self._adhoc_undo
+        if not snap or self.capture_in_progress:
+            return
+        cm.mark_superseded(self.captures_csv, snap["new_id"])
+        for capture_id in snap["old_ids"]:
+            cm.mark_superseded(self.captures_csv, capture_id, superseded=False)
+        self._adhoc_undo = None
+        self.adhoc_undo_btn.setEnabled(False)
+        self.captures_cache = cm.read_captures(self.captures_csv)
+        self.adhoc_result_card.setText("")
+        self._on_adhoc_selection_changed()
+        self.set_status(f"Removed the last point at {snap['node_label']} and restored what it replaced.", "success")
 
     # ------------------------------------------------------------------
     # Analysis tab

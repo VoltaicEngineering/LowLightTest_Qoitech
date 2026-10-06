@@ -391,7 +391,9 @@ def next_cursor(
 def interpolate_reference(ref_start: float, ref_end: float, t_start: float, t_end: float, t: float) -> float:
     if t_end == t_start:
         return ref_start
-    fraction = (t - t_start) / (t_end - t_start)
+    # Clamped: a capture taken outside its pass (an ad-hoc point added days
+    # later) gets the nearest reference, not a drift extrapolated off the end.
+    fraction = min(1.0, max(0.0, (t - t_start) / (t_end - t_start)))
     return ref_start + (ref_end - ref_start) * fraction
 
 
