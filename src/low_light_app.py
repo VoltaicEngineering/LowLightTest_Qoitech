@@ -52,6 +52,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -116,6 +117,9 @@ DEFAULT_SUMMARY_CSV = PROJECT_ROOT / "report" / "LowLightTesting_summary.csv"
 # Stable, deterministic color assignment (by sorted group label) for the
 # Analysis tab's 4 graphs, so a given panel keeps the same color
 # across redraws and across all 4 subplots.
+# Analysis tab x-axis slider stops (W/m²): 0 up to each of these.
+_ANALYSIS_X_LIMITS = (25.0, 50.0, 200.0, 1000.0)
+
 _ANALYSIS_PALETTE = [
     "#1a56db", "#c53030", "#1b8a5a", "#8a5300", "#6b46c1",
     "#0f7a8c", "#b83280", "#4a5568", "#c05621", "#2f855a",
@@ -1037,7 +1041,9 @@ class LowLightApp(QMainWindow):
         filter_row.addWidget(clear_filters_btn, alignment=Qt.AlignmentFlag.AlignBottom)
         layout.addLayout(filter_row)
 
-        analysis_fig = Figure(dpi=100, facecolor="#f0f2f5")
+        # Constrained layout re-fits the plots around the outside legend on
+        # every draw, so it stays right when the window is resized.
+        analysis_fig = Figure(dpi=100, facecolor="#f0f2f5", layout="constrained")
         self.analysis_canvas = FigureCanvas(analysis_fig)
         self.analysis_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         axes = analysis_fig.subplots(2, 2, sharex=True)
@@ -1045,16 +1051,68 @@ class LowLightApp(QMainWindow):
         self._norm_ip_ax, self._norm_isc_ax = axes[1]
         self._analysis_axes = (self._norm_wp_ax, self._norm_vp_ax, self._norm_ip_ax, self._norm_isc_ax)
         self._style_analysis_axes()
-        analysis_fig.tight_layout()
         self.analysis_canvas.draw()
         self._analysis_hover_annotation = None
         self.analysis_canvas.mpl_connect("motion_notify_event", self._guard1(self._on_analysis_hover))
 
         self.analysis_toolbar = NavigationToolbar2QT(self.analysis_canvas, tab)
-        layout.addWidget(self.analysis_toolbar)
+        toolbar_row = QHBoxLayout()
+        toolbar_row.addWidget(self.analysis_toolbar, 1)
+        self.analysis_xlim_lbl = QLabel("")
+        self.analysis_xlim_lbl.setStyleSheet("font-size:9pt; font-weight:bold;")
+        self.analysis_xlim_slider = QSlider(Qt.Orientation.Horizontal)
+        self.analysis_xlim_slider.setRange(0, len(_ANALYSIS_X_LIMITS) - 1)
+        self.analysis_xlim_slider.setPageStep(1)
+        self.analysis_xlim_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.analysis_xlim_slider.setTickInterval(1)
+        self.analysis_xlim_slider.setFixedWidth(180)
+        self.analysis_xlim_slider.setToolTip("X axis range: " + ", ".join(f"{v:g}" for v in _ANALYSIS_X_LIMITS) + " W/m²")
+        saved = self.settings.get("analysis_x_max", _ANALYSIS_X_LIMITS[-1])
+        self.analysis_xlim_slider.setValue(
+            _ANALYSIS_X_LIMITS.index(saved) if saved in _ANALYSIS_X_LIMITS else len(_ANALYSIS_X_LIMITS) - 1
+        )
+        self.analysis_xlim_slider.valueChanged.connect(self._guard1(self._on_analysis_xlim_changed))
+        toolbar_row.addWidget(self.analysis_xlim_lbl)
+        toolbar_row.addWidget(self.analysis_xlim_slider)
+        layout.addLayout(toolbar_row)
         layout.addWidget(self.analysis_canvas, 1)
+        self._update_analysis_xlim_label()
 
         return tab
+
+    def _analysis_x_max(self) -> float:
+        return _ANALYSIS_X_LIMITS[self.analysis_xlim_slider.value()]
+
+    def _update_analysis_xlim_label(self) -> None:
+        self.analysis_xlim_lbl.setText(f"X axis: 0–{self._analysis_x_max():g} W/m²")
+
+    def _on_analysis_xlim_changed(self, _value) -> None:
+        self._update_analysis_xlim_label()
+        self.settings["analysis_x_max"] = self._analysis_x_max()
+        save_settings(self.settings)
+        self._apply_analysis_x_limit()
+        self.analysis_canvas.draw_idle()
+
+    def _apply_analysis_x_limit(self) -> None:
+        """Show x from 0 to the slider's limit, and fit each plot's y range
+        to the points inside it -- otherwise zooming into low light leaves
+        Wp/Ip/Isc squashed against 0 on a 0-100 % scale."""
+        x_max = self._analysis_x_max()
+        pad_x = 0.02 * x_max
+        for ax in self._analysis_axes:
+            ax.set_xlim(-pad_x, x_max + pad_x)
+            ys = [
+                y
+                for line in ax.get_lines() if line.get_gid() != "si_reference"
+                for x, y in zip(line.get_xdata(), line.get_ydata()) if x <= x_max + pad_x
+            ]
+            if ys:
+                lo, hi = min(ys), max(ys)
+                pad_y = 0.06 * (hi - lo) if hi > lo else max(0.05 * abs(hi), 0.5)
+                ax.set_ylim(lo - pad_y, hi + pad_y)
+        toolbar = getattr(self, "analysis_toolbar", None)
+        if toolbar is not None:
+            toolbar.update()  # Home goes back to this range, not the full one
 
     def _make_filter_list(self) -> QListWidget:
         widget = QListWidget()
@@ -1491,9 +1549,18 @@ class LowLightApp(QMainWindow):
                 )
 
         self._style_analysis_axes()
+        # One legend for all four plots, in its own column on the right: inside
+        # a plot, a long panel list covered the data and squashed the layout.
+        fig = self.analysis_canvas.figure
+        for legend in list(fig.legends):
+            legend.remove()
         if plotted_groups:
-            self._norm_wp_ax.legend(fontsize=6, loc="best")
-        self.analysis_canvas.figure.tight_layout()
+            handles, labels = self._norm_wp_ax.get_legend_handles_labels()
+            fig.legend(
+                handles, labels, loc="outside right upper", fontsize=7, frameon=False,
+                ncols=1 + len(handles) // 36,
+            )
+            self._apply_analysis_x_limit()
         self.analysis_canvas.draw_idle()
 
         filters_active = bool(selected_panels or selected_cell_types or selected_series or selected_parallel)
