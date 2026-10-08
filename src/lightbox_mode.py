@@ -59,6 +59,7 @@ class Calibration:
         if not (self.folder / "campaign.json").exists() or not (self.folder / "captures.csv").exists():
             raise ValueError(f"{self.folder} is not a calibration campaign folder (needs campaign.json and captures.csv).")
         self.config, self.grid, self.passes = cr.load_calibration(self.folder)
+        self.irr_offset = cr.campaign_irr_offset(self.config)
         self.campaign_id = self.config.get("campaign_id") or self.folder.name
         self.vacs = sorted({p["vac"] for p in self.passes.values()})
         self.exclusions = cr.load_exclusions(self.folder, self.grid)
@@ -66,7 +67,8 @@ class Calibration:
     @property
     def summary(self) -> str:
         ex = f", {sum(len(e['nodes']) for e in self.exclusions)} excluded node(s)" if self.exclusions else ""
-        return f"{self.campaign_id} ({len(self.vacs)} levels, {self.vacs[0]:g}-{self.vacs[-1]:g} VAC{ex})"
+        return (f"{self.campaign_id} ({len(self.vacs)} levels, {self.vacs[0]:g}-{self.vacs[-1]:g} VAC{ex}, "
+                f"irr zero offset {self.irr_offset:.4g} W/m²)")
 
     def node_labels(self) -> list[str]:
         return cm.all_node_labels(self.grid)

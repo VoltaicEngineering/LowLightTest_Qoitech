@@ -18,6 +18,7 @@ import random
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -59,7 +60,9 @@ from matplotlib.patches import Rectangle
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import calibration_model as cm
+import calibration_report as cr
 import sensors
+import zero_offset
 from ui_style import _STYLESHEET, _STAGE_STYLE, apply_light_theme, open_in_explorer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -268,7 +271,12 @@ class LightboxCalibrationApp(QMainWindow):
         self.capture_start_ts = 0.0
         self._capture_mode = "run"
         self._capture_quantity = "lux"
+        self._capture_irr_offset: float | None = None
         self._adhoc_undo: dict | None = None
+        # Last zero offset captured on the Irr Zero Offset tab this session
+        # ({"value_wm2", "stdev_wm2", "n_samples", "duration_s", "captured_at"}),
+        # written into a campaign's campaign.json -- see _zero_offset_stop.
+        self.zo_session: dict | None = None
         self._adhoc_replacing: dict | None = None
         self.last_capture_id: str | None = None
         self._undo_snapshot: dict | None = None
@@ -317,7 +325,8 @@ class LightboxCalibrationApp(QMainWindow):
             try:
                 return fn()
             except Exception as e:
-                _log("error", "unhandled_slot_exception", slot=getattr(fn, "__name__", str(fn)), error=str(e))
+                _log("error", "unhandled_slot_exception", slot=getattr(fn, "__name__", str(fn)), error=str(e),
+                     traceback=traceback.format_exc())
                 try:
                     self.set_status(f"Internal error (caught): {e}", "error")
                 except Exception:
@@ -390,6 +399,8 @@ class LightboxCalibrationApp(QMainWindow):
 
         self.sensors_tab = self._build_sensors_tab()
         self._tab_widget.addTab(self.sensors_tab, "Sensors")
+
+        self._tab_widget.addTab(self._build_zero_offset_tab(), "Irr Zero Offset")
 
         self.run_tab = self._build_run_tab()
         self._tab_widget.addTab(self.run_tab, "Run")
@@ -646,6 +657,8 @@ class LightboxCalibrationApp(QMainWindow):
         )
         if self.campaign_note_edit.toPlainText().strip():
             config["note"] = self.campaign_note_edit.toPlainText().strip()
+        if self.zo_session is not None:
+            config["irr_zero_offset"] = dict(self.zo_session)
 
         cm.save_campaign_config(campaign_dir, config)
         self._load_campaign(campaign_dir, config)
@@ -705,6 +718,7 @@ class LightboxCalibrationApp(QMainWindow):
         self._adhoc_undo = None
         self.adhoc_undo_btn.setEnabled(False)
         self._refresh_adhoc_tab()
+        self._zero_offset_refresh_current()
         # Reset the cursor here rather than leaving a stale one from whatever
         # campaign was previously loaded in this app instance; callers that
         # are resuming set the real cursor right after this and call
@@ -884,9 +898,14 @@ class LightboxCalibrationApp(QMainWindow):
 
         irr_value, irr_ts = self.irr_store.latest()
         irr_is_live = irr_value is not None and (irr_ts is None or now - irr_ts <= sensors.LIVE_STALE_S)
+        irr_offset = self._active_irr_offset()
+        if irr_value is not None and irr_offset is not None:
+            irr_value -= irr_offset
         if irr_is_live:
             self.irr_value_lbl.setText(f"{irr_value:.4f} W/m²")
-            self.irr_badge.setText("● Irr: live")
+            self.irr_badge.setText(
+                "● Irr: live" + (f", zero offset {irr_offset:.4f} subtracted" if irr_offset is not None else ", raw")
+            )
             self.irr_badge.setStyleSheet("color:#1b5e20; font-weight:bold;")
         else:
             self.irr_value_lbl.setText("-- W/m²")
@@ -928,7 +947,9 @@ class LightboxCalibrationApp(QMainWindow):
         if lux_times:
             self.lux_ts_ax.plot([t - now for t in lux_times], lux_values, color="#1a56db", linewidth=1.2)
         if irr_times:
-            self.irr_ts_ax.plot([t - now for t in irr_times], irr_values, color="#c53030", linewidth=1.2)
+            offset = self._active_irr_offset() or 0.0
+            self.irr_ts_ax.plot([t - now for t in irr_times], [v - offset for v in irr_values],
+                                color="#c53030", linewidth=1.2)
         self._style_timeseries_axes()
         self.ts_canvas.figure.tight_layout()
         self.ts_canvas.draw_idle()
@@ -966,6 +987,211 @@ class LightboxCalibrationApp(QMainWindow):
         self.lux_live.set(lux_val)
         self.lux_history.add(lux_val)
         self.irr_store.add(irr_val)
+
+    # ------------------------------------------------------------------
+    # Irr Zero Offset tab: the irradiance sensor's reading with no light,
+    # stored in the campaign's campaign.json as "irr_zero_offset". Live
+    # irradiance and new captures have it subtracted (_active_irr_offset);
+    # each row records it in irr_offset_applied and is used as stored, so a
+    # new offset never changes captures already taken.
+    # ------------------------------------------------------------------
+
+    def _build_zero_offset_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        intro = QLabel(
+            "Cover the irradiance sensor completely (no light at all), wait for the reading to settle, "
+            "then Start Capture. Stop Capture once the running average has levelled off: the average "
+            "of every sample becomes the campaign's irradiance zero offset (the reading at 0 W/m²). "
+            "It is saved in campaign.json (the loaded campaign, or the next one you create). From then on "
+            "it is subtracted from the live irradiance readouts and plot and from every irradiance capture; "
+            "each capture row records the offset it had (irr_offset_applied) and is used as stored. "
+            "Captures taken before an offset was measured are untouched: they are raw, and the report "
+            f"subtracts the fixed {cr.IRR_ZERO_OFFSET_WM2:g} W/m² from them as before. "
+            "The plot below always shows raw readings."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#555; font-size:9pt;")
+        layout.addWidget(intro)
+
+        row = QHBoxLayout()
+        self.zo_start_btn = QPushButton("Start Capture")
+        self.zo_start_btn.setProperty("primary", True)
+        self.zo_start_btn.clicked.connect(self._guard(self._zero_offset_start))
+        self.zo_stop_btn = QPushButton("Stop Capture")
+        self.zo_stop_btn.setEnabled(False)
+        self.zo_stop_btn.clicked.connect(self._guard(self._zero_offset_stop))
+        self.zo_save_btn = QPushButton("Save to Campaign")
+        self.zo_save_btn.setToolTip("Store this session's captured offset in the loaded campaign")
+        self.zo_save_btn.setEnabled(False)
+        self.zo_save_btn.clicked.connect(self._guard(self._zero_offset_save_to_campaign))
+        self.zo_live_lbl = QLabel("Not capturing.")
+        self.zo_live_lbl.setStyleSheet("font-size:11pt; font-weight:bold;")
+        row.addWidget(self.zo_start_btn)
+        row.addWidget(self.zo_stop_btn)
+        row.addWidget(self.zo_save_btn)
+        row.addSpacing(12)
+        row.addWidget(self.zo_live_lbl, 1)
+        layout.addLayout(row)
+
+        self.zo_current_lbl = QLabel("")
+        self.zo_current_lbl.setWordWrap(True)
+        self.zo_current_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.zo_current_lbl.setStyleSheet("font-size:10pt;")
+        layout.addWidget(self.zo_current_lbl)
+
+        fig = Figure(dpi=100, facecolor="#f0f2f5")
+        self.zo_canvas = FigureCanvas(fig)
+        self.zo_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.zo_ax = fig.add_subplot(111)
+        layout.addWidget(self.zo_canvas, 1)
+
+        self.zo_capture = zero_offset.ZeroOffsetCapture(self.irr_store.history)
+        self._zo_timer = QTimer(self)
+        self._zo_timer.setInterval(250)
+        self._zo_timer.timeout.connect(self._guard(self._zero_offset_tick))
+        self._zero_offset_refresh_current()
+        self._zero_offset_draw()
+        return tab
+
+    def _active_irr_offset(self) -> float | None:
+        """Zero offset subtracted from live irradiance and new captures: the
+        loaded campaign's stored one, else this session's capture, else None
+        (raw readings)."""
+        stored = (self.config or {}).get("irr_zero_offset")
+        if stored:
+            return stored["value_wm2"]
+        if self.zo_session is not None:
+            return self.zo_session["value_wm2"]
+        return None
+
+    @staticmethod
+    def _zero_offset_text(entry: dict) -> str:
+        sd = entry.get("stdev_wm2")
+        return (f"<b>{entry['value_wm2']:.4f} W/m²</b> (captured {entry.get('captured_at', '?')}, "
+                f"{entry.get('n_samples', '?')} samples" + (f", std dev {sd:.4f}" if sd is not None else "") + ")")
+
+    def _zero_offset_refresh_current(self) -> None:
+        if self.config is None:
+            lines = ["No campaign loaded: a captured offset is saved into the next campaign you create."]
+        else:
+            stored = self.config.get("irr_zero_offset")
+            lines = [
+                f"Campaign {self.config['campaign_id']}: " + (
+                    self._zero_offset_text(stored) if stored else
+                    f"no zero offset stored; the report uses the default {cr.IRR_ZERO_OFFSET_WM2:g} W/m²."
+                )
+            ]
+        if self.zo_session is not None:
+            lines.append("This session's capture: " + self._zero_offset_text(self.zo_session))
+        self.zo_current_lbl.setText("<br>".join(lines))
+        self.zo_save_btn.setEnabled(
+            self.config is not None and self.zo_session is not None
+            and self.config.get("irr_zero_offset") != self.zo_session
+        )
+
+    def _zero_offset_start(self) -> None:
+        self.zo_capture.start()
+        self.zo_start_btn.setEnabled(False)
+        self.zo_stop_btn.setEnabled(True)
+        self.zo_live_lbl.setStyleSheet("font-size:11pt; font-weight:bold;")
+        self._zo_timer.start()
+        self._zero_offset_tick()
+
+    def _zero_offset_tick(self) -> None:
+        cap = self.zo_capture
+        cap.poll()
+        mean, sd = cap.mean(), cap.stdev()
+        parts = [f"{'Capturing' if cap.running else 'Captured'} {cap.elapsed():.0f} s", f"{cap.n} samples"]
+        if mean is not None:
+            parts.append(f"running average {mean:.4f} W/m²")
+        if sd is not None:
+            parts.append(f"std dev {sd:.4f}")
+        if cap.running and cap.n == 0 and cap.elapsed() > 5:
+            parts.append("no samples: is the irradiance sensor connected?")
+        self.zo_live_lbl.setText("   ·   ".join(parts))
+        self._zero_offset_draw()
+
+    def _zero_offset_stop(self) -> None:
+        cap = self.zo_capture
+        cap.stop()
+        self._zo_timer.stop()
+        self.zo_start_btn.setEnabled(True)
+        self.zo_stop_btn.setEnabled(False)
+        self._zero_offset_tick()
+        if cap.n < sensors.MIN_IRR_SAMPLES:
+            self.zo_live_lbl.setText(
+                f"Only {cap.n} sample(s) captured (minimum {sensors.MIN_IRR_SAMPLES}); zero offset not changed."
+            )
+            self.zo_live_lbl.setStyleSheet("font-size:11pt; font-weight:bold; color:#c53030;")
+            return
+        self.zo_live_lbl.setStyleSheet("font-size:11pt; font-weight:bold; color:#1b8a5a;")
+        sd = cap.stdev()
+        self.zo_session = {
+            "value_wm2": round(cap.mean(), 6),
+            "stdev_wm2": None if sd is None else round(sd, 6),
+            "n_samples": cap.n,
+            "duration_s": round(cap.elapsed(), 1),
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(cap.stopped_at)),
+        }
+        if self.config is not None:
+            self._zero_offset_save_to_campaign()
+        else:
+            self._zero_offset_refresh_current()
+            self.set_status(
+                f"Zero offset {self.zo_session['value_wm2']:.4f} W/m² captured; it is saved into the next campaign you create.",
+                "success",
+            )
+
+    def _zero_offset_save_to_campaign(self) -> None:
+        if self.config is None or self.zo_session is None:
+            return
+        stored = self.config.get("irr_zero_offset")
+        has_captures = any(c["quantity"] == "irr" for c in self.captures_cache)
+        if stored and stored != self.zo_session:
+            resp = QMessageBox.question(
+                self, "Replace zero offset?",
+                f"{self.config['campaign_id']} already has a zero offset of {stored['value_wm2']:.4f} W/m² "
+                f"(captured {stored.get('captured_at', '?')}).\n\nReplace it with {self.zo_session['value_wm2']:.4f} W/m²? "
+                + ("Captures already taken keep the offset they were captured with; only new ones use this value. "
+                   if has_captures else "")
+                + "The old value is kept in campaign.json under irr_zero_offset_history.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                self._zero_offset_refresh_current()
+                self.set_status("Zero offset captured but not saved to the campaign (Save to Campaign to store it).", "warning")
+                return
+            self.config.setdefault("irr_zero_offset_history", []).append(stored)
+        self.config["irr_zero_offset"] = dict(self.zo_session)
+        cm.save_campaign_config(self.campaign_dir, self.config)
+        self._zero_offset_refresh_current()
+        self.set_status(
+            f"Zero offset {self.zo_session['value_wm2']:.4f} W/m² saved to {self.config['campaign_id']}.", "success",
+        )
+
+    def _zero_offset_draw(self) -> None:
+        cap, ax = self.zo_capture, self.zo_ax
+        ax.clear()
+        if cap.n:
+            t0 = cap.started_at
+            xs = [t - t0 for t in cap.times]
+            ax.plot(xs, cap.values, color="#1a56db", linewidth=1, marker=".", markersize=3, label="Irradiance")
+            ax.plot(xs, cap.running_mean(), color="#c53030", linewidth=2, label="Running average")
+            ax.legend(loc="upper right", fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "Start Capture with the irradiance sensor covered",
+                    ha="center", va="center", transform=ax.transAxes, color="#888")
+        ax.set_title("Irradiance zero-offset capture", fontsize=10)
+        ax.set_xlabel("Seconds since Start Capture", fontsize=9)
+        ax.set_ylabel("W/m²", fontsize=9)
+        ax.grid(True, alpha=0.3)
+        self.zo_canvas.figure.tight_layout()
+        self.zo_canvas.draw_idle()
 
     # ------------------------------------------------------------------
     # Run tab
@@ -1113,11 +1339,12 @@ class LightboxCalibrationApp(QMainWindow):
         grid_widget.cell_value[label] = record.get("mean")
         if record.get("mean") is not None:
             stdev = record.get("stdev")
-            pct = record.get("three_sigma_pct")
-            grid_widget.hover_text[label] = (
-                f"{label}: {record['mean']:.2f} ± {stdev:.2f} (3σ/avg {pct:.1f}%, n={record['n_samples']})"
-                if stdev is not None else f"{label}: {record['mean']:.2f} (n={record['n_samples']})"
-            )
+            pct = record.get("three_sigma_pct")  # None when n < 2 or the mean is 0 (e.g. 0.0 lx in the dark)
+            text = f"{label}: {record['mean']:.2f}"
+            if stdev is not None:
+                text += f" ± {stdev:.2f}"
+            details = ([f"3σ/avg {pct:.1f}%"] if pct is not None else []) + [f"n={record['n_samples']}"]
+            grid_widget.hover_text[label] = f"{text} ({', '.join(details)})"
         else:
             grid_widget.hover_text[label] = f"{label}: skipped"
 
@@ -1229,6 +1456,8 @@ class LightboxCalibrationApp(QMainWindow):
         self.capture_in_progress = True
         self._capture_mode = mode
         self._capture_quantity = quantity
+        # Frozen for the whole dwell and recorded on the capture row.
+        self._capture_irr_offset = self._active_irr_offset() if quantity == "irr" else None
         self.capture_start_ts = time.time()
         self.capture_samples = []
         self._capture_timer = QTimer(self)
@@ -1242,6 +1471,8 @@ class LightboxCalibrationApp(QMainWindow):
             value, _, _ = self.lux_live.snapshot()
         else:
             value, _ = self.irr_store.latest()
+            if value is not None and self._capture_irr_offset is not None:
+                value -= self._capture_irr_offset
         if value is not None:
             self.capture_samples.append(value)
 
@@ -1271,6 +1502,7 @@ class LightboxCalibrationApp(QMainWindow):
             variac_vac=self.current_level_variac, quantity=cursor["pass"], capture_kind=cursor["next_kind"],
             node_label_=cursor["node_label"], grid=self.grid, sequence_index=cursor["sequence_index"],
             samples=self.capture_samples, duration_s=duration, sensor_port=port or "",
+            irr_offset_applied=self._capture_irr_offset,
         )
         cm.append_capture(self.captures_csv, record)
         self.last_capture_id = record["capture_id"]
@@ -1830,6 +2062,7 @@ class LightboxCalibrationApp(QMainWindow):
             grid=self.grid, sequence_index=cm.serpentine_labels(self.grid).index(node),
             samples=self.capture_samples, duration_s=time.time() - self.capture_start_ts,
             sensor_port=self._capture_port(quantity), note="adhoc",
+            irr_offset_applied=self._capture_irr_offset,
         )
         self.capture_in_progress = False
         self.adhoc_progress.setValue(0)

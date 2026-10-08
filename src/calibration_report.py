@@ -15,7 +15,10 @@ Everything is recomputed from the selected folder, so a new campaign needs no
 code change.
 
 Decisions (see the campaign notes.md):
-  * Irradiance zero offset of 0.22 W/m2 is subtracted from every irr reading.
+  * Irradiance zero offset: a capture taken after an offset was measured on
+    the calibration app's Irr Zero Offset tab already has it subtracted (its
+    irr_offset_applied column) and is used as stored. Older, raw captures
+    have the fixed 0.22 W/m2 subtracted, as before.
   * Values are NOT drift-corrected. Each pass's reference drift
     (ref_end - ref_start) / ref_start is reported as an uncertainty.
   * No curve fitting. Panel averages come straight from the measured map:
@@ -49,7 +52,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import calibration_model as cm  # noqa: E402
 
-IRR_ZERO_OFFSET_WM2 = 0.22  # sensor reads 0.22 W/m2 in the dark (AK, 2026-09-29)
+IRR_ZERO_OFFSET_WM2 = 0.22  # sensor reads 0.22 W/m2 in the dark (AK, 2026-09-29); default when a campaign has none
 OUTLIER_FRAC = 0.5
 PANEL_INTEGRATION_STEP_MM = 5.0
 CONTOUR_LEVELS_PCT = [50, 60, 70, 80, 90, 95]
@@ -93,9 +96,27 @@ def load_exclusions(folder, grid) -> list[dict]:
     return out
 
 
+def campaign_irr_offset(config: dict) -> float:
+    """The campaign's latest measured irradiance zero offset (stored in
+    campaign.json by the calibration app), else IRR_ZERO_OFFSET_WM2. This is
+    the sensor's current dark reading; it is not applied to captures here."""
+    value = (config.get("irr_zero_offset") or {}).get("value_wm2")
+    return float(value) if value is not None else IRR_ZERO_OFFSET_WM2
+
+
+def irr_value(row: dict, raw_offset: float) -> float:
+    """A capture's irradiance with the zero offset removed: as stored if it
+    was captured with one (irr_offset_applied set), else the raw reading
+    minus raw_offset."""
+    if row.get("irr_offset_applied") is not None:
+        return row["mean"]
+    return row["mean"] - raw_offset
+
+
 def load_passes(folder, irr_offset: float = IRR_ZERO_OFFSET_WM2):
     """Return (config, grid, passes). passes[(level_index, quantity)] holds the
-    raw node matrix (rows x cols, offset applied for irr), 3-sigma %, refs,
+    node matrix (rows x cols; irr through irr_value, so irr_offset only
+    applies to raw captures), 3-sigma %, refs,
     drift and the mask of nodes listed in exclusions.csv. Passes missing a
     start or end reference are skipped."""
     folder = Path(folder)
@@ -110,7 +131,9 @@ def load_passes(folder, irr_offset: float = IRR_ZERO_OFFSET_WM2):
 
     passes = {}
     for (level, q), rows in sorted(groups.items()):
-        offset = irr_offset if q == "irr" else 0.0
+        def value(row):
+            return irr_value(row, irr_offset) if q == "irr" else row["mean"]
+
         ref_s = [r for r in rows if r["capture_kind"] == "ref_start" and r["mean"] is not None]
         ref_e = [r for r in rows if r["capture_kind"] == "ref_end" and r["mean"] is not None]
         if not ref_s or not ref_e:
@@ -120,10 +143,10 @@ def load_passes(folder, irr_offset: float = IRR_ZERO_OFFSET_WM2):
         for r in rows:
             if r["capture_kind"] != "grid" or r["mean"] is None:
                 continue
-            vals[r["row_index"], r["col_index"]] = r["mean"] - offset
+            vals[r["row_index"], r["col_index"]] = value(r)
             tsig[r["row_index"], r["col_index"]] = r["three_sigma_pct"] if r["three_sigma_pct"] is not None else np.nan
-        rs = ref_s[-1]["mean"] - offset
-        re_ = ref_e[-1]["mean"] - offset
+        rs = value(ref_s[-1])
+        re_ = value(ref_e[-1])
         vac = float(rows[0]["variac_vac"])
         excluded = np.zeros((grid.rows, grid.cols), dtype=bool)
         for ex in exclusions:
@@ -500,7 +523,8 @@ def build_report(folder, irr_offset=IRR_ZERO_OFFSET_WM2, outlier_frac=OUTLIER_FR
             "sensor_head_height_mm": config.get("sensor_head_height_mm"),
         },
         "settings": {
-            "irr_zero_offset_wm2": irr_offset, "drift_corrected": False, "curve_fit": False,
+            "irr_zero_offset_wm2": irr_offset, "current_irr_zero_offset_wm2": campaign_irr_offset(config),
+            "drift_corrected": False, "curve_fit": False,
             "panel_average": f"bilinear between nodes, averaged on a {PANEL_INTEGRATION_STEP_MM:g} mm grid",
             "outlier_rule": f"|value - median(neighbours)| / median > {outlier_frac:g}, or value <= 0 after offset"
                             + "".join(f"; excluded ({e['reason'] or 'listed in ' + EXCLUSIONS_FILE}): {e['vac']:g} VAC {e['quantity']} {' '.join(e['nodes'])}" for e in exclusions),
@@ -591,7 +615,8 @@ def write_workbook(report, path: Path):
     s = report["settings"]
     for line in [
         f"Campaign: {report['campaign']['campaign_id']}", f"Generated: {report['generated_at']}",
-        f"Irradiance zero offset subtracted: {s['irr_zero_offset_wm2']} W/m2", "Drift correction: none (drift reported as uncertainty)",
+        f"Irradiance zero offset: captures taken with one measured are used as stored; "
+        f"{s['irr_zero_offset_wm2']} W/m2 is subtracted from older raw captures", "Drift correction: none (drift reported as uncertainty)",
         "Curve fitting: none. Panel averages use the measured map only.",
         f"Panel average: {s['panel_average']}. Glitch and excluded nodes are filled for this only: {s['fill_rule']}.",
         f"Outlier rule: {s['outlier_rule']}",
@@ -672,12 +697,14 @@ def main(argv=None):
     ap.add_argument("--target-irr", type=float, help="query: required panel-average irradiance, W/m2 (needs --panel); prints the VAC")
     ap.add_argument("--irr-node", help="with --target-irr: irradiance sensor grid node, e.g. B6")
     ap.add_argument("--lux-node", help="with --target-irr: lux sensor grid node, e.g. J6")
-    ap.add_argument("--irr-offset", type=float, default=IRR_ZERO_OFFSET_WM2)
+    ap.add_argument("--irr-offset", type=float, default=IRR_ZERO_OFFSET_WM2,
+                    help=f"zero offset subtracted from raw irr captures (ones taken before an offset was measured), W/m2 (default {IRR_ZERO_OFFSET_WM2:g})")
     ap.add_argument("--no-png", action="store_true")
     ap.add_argument("--no-xlsx", action="store_true")
     args = ap.parse_args(argv)
 
     report, passes, grid = build_report(args.folder, args.irr_offset)
+    irr_offset = report["settings"]["current_irr_zero_offset_wm2"]
 
     if args.target_irr is not None:
         if not args.panel:
@@ -695,7 +722,7 @@ def main(argv=None):
         print(f"  between measured {b0['vac']:g} VAC ({b0['avg']:.4g} W/m2) and {b1['vac']:g} VAC ({b1['avg']:.4g} W/m2); "
               f"expected avg lux {r['lux_avg']:.4g} lx")
         for q, sn in r["sensors"].items():
-            raw = f", raw display ~{sn['value'] + args.irr_offset:.4g}" if q == "irr" else ""
+            raw = f", raw display ~{sn['value'] + irr_offset:.4g}" if q == "irr" else ""
             print(f"  {q} sensor at {sn['node']} should read {sn['value']:.4g} {UNITS[q]} +/- {sn['drift_pct']:.1f}%{raw}; "
                   f"panel / sensor = {sn['panel_over_sensor']:.3f}" + ("  (glitch or excluded node, filled value used)" if sn["glitch"] else ""))
         return 0

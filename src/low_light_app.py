@@ -3126,7 +3126,7 @@ class LowLightApp(QMainWindow):
         if not ok:
             return False
         dlg = lbm.DarkOffsetDialog(
-            self, self.irr_store.history, lbm.cr.IRR_ZERO_OFFSET_WM2, MIN_IRR_SAMPLES,
+            self, self.irr_store.history, self.lb_calibration.irr_offset, MIN_IRR_SAMPLES,
             stored_offset=(self.irr_zero_offset, self.irr_zero_offset_info) if self.irr_zero_offset is not None else None,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:

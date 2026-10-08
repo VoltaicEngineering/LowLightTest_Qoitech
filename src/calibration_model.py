@@ -175,10 +175,17 @@ CAPTURES_CSV_FIELDNAMES = [
     "pass_id", "quantity", "capture_kind", "node_label", "col_index", "row_index",
     "x_mm", "y_mm", "sequence_index", "n_samples", "mean", "stdev", "three_sigma_pct",
     "min", "max", "duration_s", "sensor_port", "superseded", "note",
+    # Irradiance zero offset already subtracted from mean/stdev/min/max
+    # (blank = raw reading). Added 2026-10-08; older files get the column
+    # on their next write (_upgrade_header).
+    "irr_offset_applied",
 ]
 
 _CAPTURE_INT_FIELDS = {"level_index", "col_index", "row_index", "sequence_index", "n_samples", "superseded"}
-_CAPTURE_FLOAT_FIELDS = {"variac_vac", "x_mm", "y_mm", "mean", "stdev", "three_sigma_pct", "min", "max", "duration_s"}
+_CAPTURE_FLOAT_FIELDS = {
+    "variac_vac", "x_mm", "y_mm", "mean", "stdev", "three_sigma_pct", "min", "max", "duration_s",
+    "irr_offset_applied",
+}
 
 
 def new_capture_id() -> str:
@@ -204,8 +211,11 @@ def make_capture_record(
     sensor_port: str,
     timestamp_iso: str | None = None,
     note: str = "",
+    irr_offset_applied: float | None = None,
 ) -> dict:
-    """Build one captures.csv row (as a dict) from raw samples."""
+    """Build one captures.csv row (as a dict) from the samples. Pass
+    irr_offset_applied when the samples already have the irradiance zero
+    offset subtracted, so the raw reading stays recoverable."""
     stats = compute_stats(samples)
     col_index, row_index = parse_node_label(node_label_)
     x_mm, y_mm = node_coords_mm(col_index, row_index, grid.pitch_mm)
@@ -234,6 +244,7 @@ def make_capture_record(
         "sensor_port": sensor_port,
         "superseded": 0,
         "note": note,
+        "irr_offset_applied": irr_offset_applied,
     }
 
 
@@ -248,6 +259,8 @@ def append_capture(csv_path, record: dict) -> None:
     csv_file = Path(csv_path)
     csv_file.parent.mkdir(parents=True, exist_ok=True)
     file_exists = csv_file.exists()
+    if file_exists:
+        _upgrade_header(csv_file)
     with csv_file.open("a", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CAPTURES_CSV_FIELDNAMES)
         if not file_exists:
@@ -255,6 +268,25 @@ def append_capture(csv_path, record: dict) -> None:
         writer.writerow({k: _csv_cell(record.get(k, "")) for k in CAPTURES_CSV_FIELDNAMES})
         fh.flush()
         os.fsync(fh.fileno())
+
+
+def _upgrade_header(csv_file: Path) -> None:
+    """Rewrite a captures.csv written with an older column set so appended
+    rows line up with the header (missing columns become blank)."""
+    with csv_file.open("r", newline="", encoding="utf-8") as fh:
+        header = next(csv.reader(fh), None)
+    if header is None or header == CAPTURES_CSV_FIELDNAMES:
+        return
+    rows = _read_captures_raw(csv_file)
+    tmp = csv_file.with_suffix(".csv.tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=CAPTURES_CSV_FIELDNAMES)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") or "" for k in CAPTURES_CSV_FIELDNAMES})
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(csv_file)
 
 
 def _csv_cell(value):
