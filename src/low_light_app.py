@@ -3043,7 +3043,14 @@ class LowLightApp(QMainWindow):
         new_round_btn = QPushButton("New Round…")
         new_round_btn.setToolTip("Start a new round: new setpoint and a fresh dark-offset reading")
         new_round_btn.clicked.connect(self._guard(self._lightbox_new_round))
+        reset_light_btn = QPushButton("Re-set Light…")
+        reset_light_btn.setToolTip(
+            "Reload the calibration and work out the VAC for this round's setpoint again, then trim the "
+            "light: for the current panel size now, or at the next Run Test if no light is set yet"
+        )
+        reset_light_btn.clicked.connect(self._guard(self._lightbox_force_light_setting))
         round_row.addWidget(self.lb_round_lbl, 1)
+        round_row.addWidget(reset_light_btn)
         round_row.addWidget(new_round_btn)
         lay.addLayout(round_row)
 
@@ -3236,24 +3243,8 @@ class LowLightApp(QMainWindow):
             )
 
         if rd.needs_light_setting(w, h):
-            try:
-                light = cal.light_setting(rd.setpoint, w, h, irr_node)
-            except ValueError as e:
-                QMessageBox.warning(self, "Setpoint not reachable", str(e))
-                self.set_status(f"{panel_name}: {e}", "warning")
+            if not self._lightbox_set_light(panel_name, w, h, irr_node):
                 return None
-            trim = lbm.TrimDialog(
-                self, panel_name, (w, h), rd.setpoint, light, rd.dark_offset,
-                self.settings.get("lightbox_trim_tolerance_pct", 2.0), self._lightbox_live_irr,
-            )
-            if trim.exec() != QDialog.DialogCode.Accepted:
-                self.set_status("Run cancelled — light not set.", "info")
-                return None
-            light["vac_set"] = trim.vac_set
-            rd.size, rd.light = (w, h), light
-            self.set_status(
-                f"Light set for {w:g} × {h:g} mm: {light['vac_target']:.1f} VAC target, {trim.vac_set:.1f} VAC as set.", "info"
-            )
         else:
             self.set_status(f"Same size as {rd.last_panel}: light unchanged ({rd.light['vac_set']:.1f} VAC).", "info")
 
@@ -3272,6 +3263,64 @@ class LowLightApp(QMainWindow):
             "irr_expected": exp["nodes"]["irr"]["value"], "lux_expected": exp["nodes"]["lux"]["value"],
             "campaign": cal.campaign_id if cal.campaign_id == cal.folder.name else f"{cal.campaign_id} ({cal.folder.name})",
         }
+
+    def _lightbox_set_light(self, panel_name: str, w: float, h: float, irr_node: str) -> bool:
+        """VAC for the round's setpoint from the calibration, then the trim
+        dialog. On success the round's light is set for w x h; on failure or
+        cancel it is left as it was."""
+        cal, rd = self.lb_calibration, self.lb_round
+        try:
+            light = cal.light_setting(rd.setpoint, w, h, irr_node)
+        except ValueError as e:
+            QMessageBox.warning(self, "Setpoint not reachable", str(e))
+            self.set_status(f"{panel_name}: {e}", "warning")
+            return False
+        trim = lbm.TrimDialog(
+            self, panel_name, (w, h), rd.setpoint, light, rd.dark_offset,
+            self.settings.get("lightbox_trim_tolerance_pct", 2.0), self._lightbox_live_irr,
+        )
+        if trim.exec() != QDialog.DialogCode.Accepted:
+            self.set_status("Light not set — trim cancelled.", "info")
+            return False
+        light["vac_set"] = trim.vac_set
+        rd.size, rd.light = (w, h), light
+        self.set_status(
+            f"Light set for {w:g} × {h:g} mm: {light['vac_target']:.1f} VAC target, {trim.vac_set:.1f} VAC as set.", "info"
+        )
+        self._lightbox_refresh_info()
+        return True
+
+    def _lightbox_force_light_setting(self) -> None:
+        """Re-set Light…: reload the calibration from disk (picks up points
+        added since it was loaded), recompute the VAC for the round's
+        setpoint and trim again. Keeps the round's setpoint and dark offset."""
+        if self._measuring:
+            self.set_status("Wait for the current measurement to finish before re-setting the light.", "warning")
+            return
+        if self.lb_calibration is None and not self._lightbox_choose_calibration():
+            return
+        if self.lb_round is None:
+            self._lightbox_new_round()  # its first Run Test sets the light
+            return
+        if not self._lightbox_load_calibration(self.lb_calibration.folder):
+            return
+        rd = self.lb_round
+        if rd.light is None:
+            self.set_status(
+                f"Calibration reloaded. The light for {rd.setpoint:g} W/m² is set at the next Run Test.", "info"
+            )
+            return
+        w, h = rd.size
+        old_vac = rd.light["vac_set"]
+        panel = rd.last_panel or self.panel_name_edit.text().strip() or "current panel"
+        if self._lightbox_set_light(panel, w, h, self.lb_irr_node_combo.currentText()):
+            self.set_status(
+                f"Light re-set for {rd.setpoint:g} W/m² over {w:g} × {h:g} mm: "
+                f"{rd.light['vac_target']:.1f} VAC target, {rd.light['vac_set']:.1f} VAC as set (was {old_vac:.1f}).",
+                "success",
+            )
+        else:
+            self.set_status(f"Re-set cancelled — light unchanged ({old_vac:.1f} VAC as set).", "info")
 
     def _lightbox_row_fields(self, ctx: dict, irr_mean, lux_mean):
         """Extra summary-CSV fields for a lightbox row, and a warning text if
