@@ -974,7 +974,11 @@ class LowLightApp(QMainWindow):
         self.btn_reset = QPushButton("Start Over")
         self.btn_reset.setProperty("danger", True)
         self.btn_reset.clicked.connect(self._guard(self._start_over))
+        self.btn_export = QPushButton("Export CSV…")
+        self.btn_export.setToolTip("Save the session measurements table, as shown, to a CSV file")
+        self.btn_export.clicked.connect(self._guard(self._export_session_table))
         btn_row.addWidget(self.btn_finish, 2)
+        btn_row.addWidget(self.btn_export, 1)
         btn_row.addWidget(self.btn_reset, 1)
         blay.addLayout(btn_row)
 
@@ -3847,6 +3851,28 @@ class LowLightApp(QMainWindow):
                 cells.append(item.text() if item else "")
             lines.append("\t".join(cells))
         copy_to_clipboard("\n".join(lines))
+
+    def _export_session_table(self):
+        """The session table as shown (visible columns, displayed values) to a
+        CSV chosen by the operator. utf-8-sig so Excel reads W/m² and σ."""
+        if self.table.rowCount() == 0:
+            self.set_status("No measurements in the session table to export", "warning")
+            return
+        default = Path(self.working_dir) / time.strftime("session-%Y%m%d-%H%M%S.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Session Table", str(default), "CSV files (*.csv)")
+        if not path:
+            return
+        cols = [c for c in range(self.table.columnCount()) if not self.table.isColumnHidden(c)]
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow([self.table.horizontalHeaderItem(c).text() for c in cols])
+                for r in range(self.table.rowCount()):
+                    writer.writerow([self.table.item(r, c).text() if self.table.item(r, c) else "" for c in cols])
+        except OSError as e:
+            QMessageBox.warning(self, "Export failed", f"Could not write {path}: {e}")
+            return
+        self.set_status(f"Exported {self.table.rowCount()} measurement(s) to {path}", "success")
 
     def _save_all_and_finish(self):
         if not self.session_rows:
